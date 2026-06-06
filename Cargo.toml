@@ -3,7 +3,7 @@ name = "spm"
 version = "0.1.0"
 edition = "2021"
 description = "Samad Package Manager - A universal Linux package manager"
-authors = ["spm@samad.iq"]
+authors = ["aloosh101]
 autobins = false
 
 [[bin]]
