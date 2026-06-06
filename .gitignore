@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+
+# Local/Development configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+*.log
+
+# Rustfmt backups
+**/*.rs.bk
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Custom Git directories
+.nogit/
+
+# Debug output
+*.log
+
+.opencode
+.opencode*
+
+.claude
+.claude*
+
+.github
+.github*
+
+.codex
+.codex*

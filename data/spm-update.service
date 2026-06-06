@@ -1,0 +1,10 @@
+[Unit]
+Description=SPM Repository Update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/spm update
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=yes
+NoNewPrivileges=yes

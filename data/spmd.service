@@ -1,0 +1,19 @@
+[Unit]
+Description=SPM Package Manager Daemon
+Requires=spmd.socket
+After=network.target spmd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spmd
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/spm.sock /var/lib/spm /var/cache/spm
+
+[Install]
+WantedBy=multi-user.target

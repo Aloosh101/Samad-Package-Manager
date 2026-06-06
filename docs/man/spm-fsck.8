@@ -1,0 +1,58 @@
+.TH SPM\-FSCK 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm\-fsck \- Check and repair spm database integrity
+.SH SYNOPSIS
+.B spm fsck
+[\fB\-\-fix\fR] [\fB\-\-files\fR]
+.SH DESCRIPTION
+Check the spm database for consistency and integrity issues.
+.P
+\fBspm fsck\fR verifies that:
+.IP \(bu 2
+All installed packages have valid metadata records
+.IP \(bu 2
+File records are consistent with installed packages
+.IP \(bu 2
+No orphaned file records exist in the database
+.IP \(bu 2
+Package references (dependencies, conflicts) are valid
+.P
+Without flags, \fBspm fsck\fR performs a read-only check and reports
+any issues it finds without making modifications.
+.SH OPTIONS
+.TP
+\fB\-\-fix\fR
+Attempt to repair any detected issues automatically.
+Orphaned file records are removed, missing metadata is restored
+from available sources, and inconsistent references are corrected.
+.TP
+\fB\-\-files\fR
+Additionally verify that all recorded file paths exist on disk.
+Files that are missing on disk but recorded in the database are
+reported as inconsistencies.
+.SH EXIT STATUS
+.TP
+0
+No issues found (or all issues were fixed with \fB\-\-fix\fR).
+.TP
+1
+Issues were detected and not fixed (no \fB\-\-fix\fR flag).
+.SH EXAMPLES
+.IP \(bu 2
+\fBspm fsck\fR
+Check database integrity (read-only).
+.IP \(bu 2
+\fBspm fsck \-\-fix\fR
+Check and automatically repair issues.
+.IP \(bu 2
+\fBspm fsck \-\-files\fR
+Check database integrity and verify files on disk.
+.IP \(bu 2
+\fBspm fsck \-\-fix \-\-files\fR
+Full check and repair including file verification.
+.SH SEE ALSO
+.BR spm (8),
+.BR spm\-sync (8),
+.BR spm\-init (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>

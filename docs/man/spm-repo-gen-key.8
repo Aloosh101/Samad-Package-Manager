@@ -1,0 +1,40 @@
+.TH SPM\-REPO\-GEN\-KEY 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm\-repo\-gen\-key \- Generate an Ed25519 signing keypair for a repository
+.SH SYNOPSIS
+.B spm repo gen-key
+\fIname\fR
+.SH DESCRIPTION
+Generate a new Ed25519 cryptographic keypair for signing repository
+Release files.  The keypair is stored as PEM-encoded files under
+\fB~/.config/spm/repos/signing\-keys/\fR (or \fB/etc/spm/repos.d/signing\-keys/\fR
+for system-wide configuration).
+.P
+The generated public key fingerprint is displayed after creation.
+The repository's configuration in \fB/etc/spm/repos.d/\fR is updated
+automatically to reference the new signing key.
+.P
+Only one keypair per repository is supported.  Running \fBgen-key\fR
+on a repository that already has a signing key will overwrite the
+existing keypair.
+.SH ARGUMENTS
+.TP
+\fIname\fR
+The name of the repository (as configured in \fB/etc/spm/repos.d/\fR).
+.SH FILES
+.TP
+\fB~/.config/spm/repos/signing-keys/<name>.pem\fR
+Private key (PEM-encoded Ed25519).
+.TP
+\fB~/.config/spm/repos/signing-keys/<name>.pub\fR
+Public key (PEM-encoded Ed25519).
+.SH EXAMPLES
+.IP \(bu 2
+\fBspm repo gen-key myrepo\fR
+Generate a signing keypair for the \fImyrepo\fR repository.
+.SH SEE ALSO
+.BR spm (8),
+.BR spm\-repo\-sign (8),
+.BR spm\-repo\-publish (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>

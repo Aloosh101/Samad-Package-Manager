@@ -1,0 +1,40 @@
+.TH SPM\-SYNC 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm\-sync \- Import foreign packages into the spm database
+.SH SYNOPSIS
+.B spm sync
+[\fB\-\-files\fR] [\fB\-\-prune\fR]
+.SH DESCRIPTION
+Import packages from the system's native package manager (dpkg or rpm)
+into the spm database.  This allows spm to track and manage packages
+that were installed through foreign package managers.
+.P
+Without any flags, \fBspm sync\fR imports metadata only: package names,
+versions, and format information are recorded.  Installed file records
+are not imported by default.
+.SH OPTIONS
+.TP
+\fB\-\-files\fR
+Also import file records for each foreign package.  This enables
+complete file-level tracking within spm.
+.TP
+\fB\-\-prune\fR
+Remove spm database entries for foreign packages that are no longer
+installed on the system.  This keeps the database consistent with the
+underlying package manager's state.
+.SH EXAMPLES
+.IP \(bu 2
+\fBspm sync\fR
+Import metadata for all foreign packages.
+.IP \(bu 2
+\fBspm sync \-\-files\fR
+Import metadata with file tracking.
+.IP \(bu 2
+\fBspm sync \-\-prune\fR
+Clean up stale entries for removed foreign packages.
+.SH SEE ALSO
+.BR spm (8),
+.BR spm\-fsck (8),
+.BR spm\-init (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>

@@ -1,0 +1,41 @@
+.TH SPM\-REPO\-SIGN 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm\-repo\-sign \- Sign a repository Release file with the configured key
+.SH SYNOPSIS
+.B spm repo sign
+\fIname\fR
+.SH DESCRIPTION
+Sign a repository's Release file using the Ed25519 keypair previously
+generated with \fBspm repo gen-key\fR.
+.P
+The signing process creates the following files depending on the
+repository format:
+.TP
+Native repositories
+\fBRelease.sig\fR \(em detached signature for the \fBRelease\fR file.
+.TP
+Apt repositories
+\fBRelease.sig\fR \(em detached signature, and \fBInRelease\fR \(em clearsigned
+Release file (signature embedded inline).
+.TP
+DNF repositories
+\fBrepomd.xml.asc\fR \(em ASCII-armored detached signature for
+\fBrepodata/repomd.xml\fR.
+.P
+The repository is automatically signed after each \fBspm repo publish\fR
+if a signing key is configured.  This command is only needed for
+re-signing after manual changes to the repository metadata.
+.SH ARGUMENTS
+.TP
+\fIname\fR
+The name of the repository whose Release file should be signed.
+.SH EXAMPLES
+.IP \(bu 2
+\fBspm repo sign myrepo\fR
+Sign the Release file of the \fImyrepo\fR repository.
+.SH SEE ALSO
+.BR spm (8),
+.BR spm\-repo\-gen\-key (8),
+.BR spm\-repo\-publish (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>

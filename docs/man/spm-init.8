@@ -1,0 +1,83 @@
+.TH SPM\-INIT 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm\-init \- Initialize spm directory structure, database, and backends
+.SH SYNOPSIS
+.B spm init
+[\fB\-\-root\fR=\fIpath\fR] [\fB\-\-from-system\fR] [\fB\-\-fix-backend\fR]
+.SH DESCRIPTION
+Initialize the spm runtime environment.  \fBspm init\fR creates the
+necessary directory structure, sets up the SQLite database with the
+current schema, and prepares the package cache, archives, and backend
+storage directories.
+.P
+This command is typically run during initial setup, after a fresh
+install, or when recovering from a corrupted backend store.
+.SS Backend Initialization
+SPM manages its own backend binaries (dnf, apt-get, rpm, dpkg, etc.)
+in isolation from the system.  Backends are stored in:
+.P
+.nf
+  /var/lib/spm/store/backend/{name}/bin/{name}
+.fi
+.P
+During initialization, SPM copies bundled backends from
+\fB/usr/libexec/spm/backend/\fR into this store directory.  This
+ensures SPM continues to work even if the system package manager
+is removed.
+.SH OPTIONS
+.TP
+\fB\-\-root\fR=\fIpath\fR
+Initialize spm under a custom root directory instead of the default
+\fB/var/lib/spm\fR.  Useful for chroot environments, containers, or
+alternate installation targets.
+.TP
+\fB\-\-from-system\fR
+After initialization, immediately import all currently installed
+packages from the system's native package manager (dpkg or rpm) into
+the spm database.  This is equivalent to running \fBspm sync\fR after
+\fBspm init\fR.
+.TP
+\fB\-\-fix-backend\fR
+Reinstall backend binaries from the bundled directory
+(\fB/usr/libexec/spm/backend/\fR) into the spm store
+(\fB/var/lib/spm/store/backend/\fR).  This fixes cases where backend
+binaries have been accidentally removed or corrupted.  Automatically
+enabled when \fB\-\-root\fR or \fB\-\-from-system\fR is used.
+.SH FILES
+.TP
+\fB/var/lib/spm/metadata.db\fR
+SQLite database storing all package metadata.
+.TP
+\fB/var/lib/spm/packages/\fR
+Extracted package data per installed package.
+.TP
+\fB/var/lib/spm/store/backend/\fR
+Managed backend binaries (dnf, apt-get, rpm, dpkg, etc.).
+.TP
+\fB/var/cache/spm/archives/\fR
+Cached SAM archive files.
+.TP
+\fB/etc/spm/repos.d/*.list\fR
+Repository configuration files.
+.TP
+\fB/usr/libexec/spm/backend/\fR
+Bundled backend binaries shipped with the spm package.
+.SH EXAMPLES
+.IP \(bu 2
+\fBspm init\fR
+Initialize spm with default settings.
+.IP \(bu 2
+\fBspm init \-\-fix-backend\fR
+Reinstall backend binaries from the bundled directory.
+.IP \(bu 2
+\fBspm init \-\-from-system\fR
+Initialize and import all existing packages.
+.IP \(bu 2
+\fBspm init \-\-root /mnt/chroot\fR
+Initialize spm for a chroot environment.
+.SH SEE ALSO
+.BR spm (8),
+.BR spm\-sync (8),
+.BR spm\-fsck (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>

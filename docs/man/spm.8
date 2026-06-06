@@ -1,0 +1,202 @@
+.TH SPM 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.SH NAME
+spm \- Samad Package Manager, a universal Linux package manager
+.SH SYNOPSIS
+.B spm
+\fIcommand\fR [\fIoptions\fR]
+.SH DESCRIPTION
+\fBspm\fR is a universal Linux package manager that works with
+native SAM packages and foreign formats (deb, rpm).  It supports
+cross-distro installations (install Debian packages on Fedora, etc.),
+dependency resolution, sandboxed installations, repository management,
+cryptographic signing, and a privilege-separated daemon.
+.P
+The \fBspmd\fR daemon automatically refreshes repository metadata
+(configurable via \fBspm config set auto_update_interval <seconds>\fR).
+.P
+SPM can operate in three modes:
+.IP \fBParasite mode\fR (default)
+Leverages apt/dnf as managed backends for foreign packages.
+.IP \fBSmart mode\fR (\fB\-\-smart\fR)
+Isolates libraries via RPATH/store for cross-distro compatibility.
+.IP \fBSandbox mode\fR (\fB\-\-sandbox\fR)
+Full namespace isolation (PID, mount, network, UTS) with read-only root.
+.SS Backend Architecture
+SPM is the \fIsole package manager\fR visible to the user.  The underlying
+system package managers (dnf, apt, rpm, dpkg) are never called directly.
+Instead, SPM manages them as backend binaries stored in:
+.P
+.nf
+  /var/lib/spm/store/backend/{name}/bin/{name}
+.fi
+.P
+When a backend is resolved, SPM checks in order:
+.IP 1. 3
+Store-managed copy (\fB/var/lib/spm/store/backend/\fR)
+.IP 2. 3
+Bundled copy shipped with spm (\fB/usr/libexec/spm/backend/\fR)
+.P
+The system \fBPATH\fR is never consulted.  This means removing dnf or
+apt from the system does not affect SPM's ability to use them.
+.P
+If backends are missing, SPM displays a warning at the start of every
+command.  Run \fBspm init \-\-fix-backend\fR to restore them from the
+bundled directory.
+.SH COMMANDS
+.SS Package Management
+.TP
+.BR install ", " i
+Install packages from repositories or local files.
+Supports \fB\-\-sandbox\fR, \fB\-\-smart\fR, \fB\-\-replace\fR, \fB\-y\fR.
+.TP
+.BR remove ", " r
+Remove installed packages.  Preserves conffiles.
+.TP
+.BR purge ", " p
+Remove packages along with their configuration and conffiles.
+.TP
+.BR autoremove
+Remove orphaned packages (no other package depends on them).
+.TP
+.BR update ", " u
+Fetch the latest repository metadata from all sources.
+.TP
+.BR upgrade ", " upg
+Upgrade all (or specific) installed packages to the latest version.
+Supports \fB\-\-prefer\-newest\fR.
+.TP
+.BR dist\-upgrade
+Full distribution upgrade: upgrades all packages, removes obsoleted,
+and removes orphaned packages in one operation.
+.SS Query Commands
+.TP
+.BR search ", " s
+Search configured repositories for packages by name or description.
+.TP
+.BR global-search ", " gs
+Search remote package sources (Debian API, COPR API) across distributions.
+.TP
+.BR info ", " show
+Show detailed information about an installed package.
+.TP
+.BR files ", " ls
+List files owned by an installed package.
+.TP
+.BR depends ", " deps
+Show direct dependencies of a package (queries SPM DB first, falls back to apt-cache/dnf).
+.TP
+.BR rdepends ", " rdeps
+Show packages that depend on the given package.
+.TP
+.BR search\-file
+Find which installed package owns a given file path.
+Queries SPM DB file index first, falls back to dpkg -S / rpm -qf.
+.SS System Commands
+.TP
+.BR init
+Initialize SPM directory structure, database, and backends.
+See \fBspm\-init\fR(8).
+.TP
+.BR sync
+Synchronize the SPM database with system package state (dpkg/rpm).
+See \fBspm\-sync\fR(8).
+.TP
+.BR fsck
+Check and repair database integrity.
+See \fBspm\-fsck\fR(8).
+.TP
+.BR cleanup
+Clean orphaned files, package cache, and temporary data.
+.TP
+.BR history ", " log
+View transaction history or undo a past transaction.
+.TP
+.BR snapshot ", " snap
+Create or rollback Btrfs snapshots.
+.SS Administrative Commands
+.TP
+.BR repo ", " repository
+Manage repositories (add, list, remove, create, publish, gen-key, sign).
+.TP
+.BR config
+View or modify SPM configuration (auto_update_interval, sandbox level, etc.).
+.TP
+.BR group
+Manage the \fBspm\fR UNIX group for daemon access control.
+.TP
+.BR detect
+Detect hardware (GPU, kernel) and suggest or install drivers.
+.TP
+.BR analyze ", " an
+Analyze the system for orphaned files, conflicts, or file traces.
+.SS Development Commands
+.TP
+.BR build ", " b
+Build a .sam package from a source directory.
+.TP
+.BR index
+Rebuild the SONAME index from cached repository metadata.
+.SS Sandbox Commands
+.TP
+.BR sandbox
+Manage sandboxed packages: list sandboxes or run commands inside them.
+.TP
+.BR ps
+List processes using deleted files (lsof-style).
+.SH GLOBAL OPTIONS
+.TP
+\fB\-\-help\fR
+Show help information.
+.TP
+\fB\-\-version\fR
+Show version information.
+.SH ENVIRONMENT
+.TP
+\fBSPM_ROOT\fR
+Override the root directory for all SPM paths.  Enables isolated
+E2E testing and chroot usage without sudo.
+.TP
+\fBSPM_UNSAFE=1\fR
+Allow installation of packages with unknown or missing signatures.
+.TP
+\fBSPM_BIN\fR
+Override the spm binary path for integration tests.
+.SH FILES
+.TP
+\fB/etc/spm/spm.conf\fR
+System-wide configuration file.
+.TP
+\fB~/.config/spm/spm.conf\fR
+User-specific configuration file.
+.TP
+\fB/etc/spm/repos.d/*.list\fR
+Repository configuration files.
+.TP
+\fB/var/lib/spm/metadata.db\fR
+Package metadata SQLite database.
+.TP
+\fB/var/lib/spm/store/\fR
+Nix-style content-addressed package store (sharded by hash).
+.TP
+\fB/var/lib/spm/store/backend/\fR
+Managed backend binaries (dnf, apt, rpm, dpkg, etc.).
+.TP
+\fB/usr/libexec/spm/backend/\fR
+Bundled backend binaries shipped with the spm package.
+.TP
+\fB/var/lib/spm/packages/\fR
+Extracted package data per installed package.
+.TP
+\fB/var/cache/spm/archives/\fR
+Cached package archive files.
+.TP
+\fB/run/spm/spmd.sock\fR
+Daemon UNIX socket (path respects \fB$SPM_ROOT\fR).
+.SH SEE ALSO
+.BR spm\-sync (8),
+.BR spm\-fsck (8),
+.BR spm\-init (8),
+.BR spm\-repo\-gen\-key (8),
+.BR spm\-repo\-sign (8)
+.SH AUTHOR
+Samad Package Manager <spm@samad.iq>
