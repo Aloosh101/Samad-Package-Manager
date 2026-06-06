@@ -13,7 +13,7 @@ pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<
 
     let (_target_format, repo_name, repo_config) = repos_list
         .iter()
-        .find(|(_, rc)| repo_has_package(name, rc))
+        .find(|(rn, rc)| repo_has_package(name, rn, rc))
         .map(|(rn, rc)| {
             let fmt = source_to_format(&rc.source);
             (fmt, rn.clone(), rc.clone())

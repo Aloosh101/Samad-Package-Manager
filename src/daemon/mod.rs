@@ -107,9 +107,9 @@ impl RateLimiter {
 
 #[cfg(unix)]
 fn signal() -> SpmResult<()> {
-    tracing::info!("Registered SIGINT/SIGTERM handlers via tokio");
+    tracing::info!("Registered signal handlers via tokio");
 
-    // Spawn a task to listen for shutdown signals
+    // Spawn a task to listen for signals
     tokio::spawn(async {
         use tokio::signal::unix::{signal, SignalKind};
 
@@ -117,13 +117,27 @@ fn signal() -> SpmResult<()> {
             .expect("Failed to register SIGINT handler");
         let mut sigterm = signal(SignalKind::terminate())
             .expect("Failed to register SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup())
+            .expect("Failed to register SIGHUP handler");
 
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    tracing::info!("SIGINT received, shutting down...");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received, shutting down...");
+                    break;
+                }
+                _ = sighup.recv() => {
+                    // SIGHUP — ignore on terminal session end so daemon survives
+                    tracing::debug!("SIGHUP received (ignored)");
+                }
+            }
         }
 
-        tracing::info!("Shutdown signal received, cleaning up...");
+        tracing::info!("Cleaning up...");
         let _ = std::fs::remove_file(socket_path());
         std::process::exit(0);
     });

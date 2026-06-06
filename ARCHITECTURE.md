@@ -321,7 +321,7 @@ resolve("dnf"):
 - `SO_PEERCRED` kernel-level authentication
 - Rate limiter (max 10 req/s per user)
 - Concurrency limiter (max 3 concurrent per user)
-- Signal handling (SIGINT/SIGTERM via tokio)
+- Signal handling (SIGINT/SIGTERM shutdown, SIGHUP ignored — via tokio `select!` loop)
 - Request handling: install, remove, upgrade, repo management
 - Client-server protocol via `DaemonRequest`/`DaemonResponse`
 

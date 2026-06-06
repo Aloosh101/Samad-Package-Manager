@@ -544,12 +544,20 @@ impl<'a> TransactionEngine<'a> {
         repos_list: &[(String, RepoConfig)],
         replace: bool,
     ) -> SpmResult<fetch::FetchedPackage> {
+        // Try matching repos first, then Native repos as fallback
         for (rn, rc) in repos_list {
-            if rc.source != *matching_source && rc.source != RepoSource::Native {
-                continue;
+            if rc.source == *matching_source {
+                if let Ok(fetched) = fetch::fetch_and_extract(name, rn, rc, replace, self.conn) {
+                    return Ok(fetched);
+                }
             }
-            if let Ok(fetched) = fetch::fetch_and_extract(name, rn, rc, replace, self.conn) {
-                return Ok(fetched);
+        }
+        // Fallback: try Native repos for any format
+        for (rn, rc) in repos_list {
+            if rc.source == RepoSource::Native && *matching_source != RepoSource::Native {
+                if let Ok(fetched) = fetch::fetch_and_extract(name, rn, rc, replace, self.conn) {
+                    return Ok(fetched);
+                }
             }
         }
         Err(SpmError::package_not_found(format!(

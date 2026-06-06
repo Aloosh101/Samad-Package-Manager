@@ -10,7 +10,7 @@ use crate::types::SpmConfig;
 use crate::util::process;
 
 #[derive(Parser, Debug)]
-#[command(name = "spm", version = "0.1.0", about = "Samad Package Manager")]
+#[command(name = "spm", version = "0.1.2", about = "Samad Package Manager")]
 pub struct SpmArgs {
     #[command(subcommand)]
     pub command: SpmCommand,
@@ -299,7 +299,7 @@ pub enum SpmCommand {
 
     /// Bootstrap a fresh system: initialize directories, database, and backends
     #[command(
-        after_help = "SPM manages its own backend binaries (dnf, apt, rpm, dpkg) in isolation.\nBackends are stored at /var/lib/spm/store/backend/ and are never resolved\nfrom the system PATH. If backends are missing, every command will warn you.\n\nExamples:\n  spm init                     Initialize directories, DB, and backends\n  spm init --fix-backend       Reinstall bundled backends to store\n  spm init --root /mnt         Initialize for a chroot target\n  spm init --from-system       Initialize + import all system packages"
+        after_help = "SPM manages its own backend binaries (dnf, apt, rpm, dpkg) in isolation.\nBackends are stored at /var/lib/spm/store/backend/ and are never resolved\nfrom the system PATH. If backends are missing, every command will warn you.\n\nExamples:\n  spm init                     Initialize directories, DB, and backends\n  spm init --fix-backend       Reinstall bundled backends to store\n  spm init --root /mnt         Initialize for a chroot target\n  spm init --from-system       Initialize + import all system packages\n  spm init --install-daemon    Install spmd systemd service and start it"
     )]
     Init {
         /// Target root directory (for bootstrapping a chroot)
@@ -311,6 +311,9 @@ pub enum SpmCommand {
         /// Reinstall backend binaries from /usr/libexec/spm/backend/ into the store
         #[arg(long)]
         fix_backend: bool,
+        /// Install spmd systemd service for daemon-based installs
+        #[arg(long)]
+        install_daemon: bool,
     },
 }
 
@@ -512,9 +515,15 @@ impl SpmArgs {
                         match client::send_install_request(package) {
                             Ok(msg) => println!("{}", msg),
                             Err(e) => {
-                                crate::output::step_warn(format!("Daemon unavailable: {e}"));
-                                crate::output::step_info("Falling back to direct installation...");
-                                install::install_package_smart(package, None, *replace, *yes, *smart, strategy, preferred_source)?;
+                                let msg = format!("{e}");
+                                if msg.starts_with("Cannot connect to spmd") {
+                                    crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                                    crate::output::step_info("Falling back to direct installation...");
+                                    install::install_package_smart(package, None, *replace, *yes, *smart, strategy, preferred_source)?;
+                                } else {
+                                    let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
+                                    return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
+                                }
                             }
                         }
                     }
@@ -528,7 +537,12 @@ impl SpmArgs {
                     match client::send_repo_request("add", name, Some(source), url.as_deref(), mirror) {
                         Ok(msg) => println!("{}", msg),
                         Err(e) => {
-                            crate::output::step_warn(format!("Daemon unavailable: {e}"));
+                            let msg = format!("{e}");
+                            if msg.starts_with("Cannot connect to spmd") {
+                                crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                            } else {
+                                crate::output::step_warn(format!("Daemon error: {msg}"));
+                            }
                             crate::output::step_info("Falling back to direct repo add...");
                             let source_enum = match source.as_str() {
                                 "apt" => crate::types::RepoSource::Apt,
@@ -553,7 +567,12 @@ impl SpmArgs {
                     match client::send_repo_request("remove", name, None, None, &[]) {
                         Ok(msg) => println!("{}", msg),
                         Err(e) => {
-                            crate::output::step_warn(format!("Daemon unavailable: {e}"));
+                            let msg = format!("{e}");
+                            if msg.starts_with("Cannot connect to spmd") {
+                                crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                            } else {
+                                crate::output::step_warn(format!("Daemon error: {msg}"));
+                            }
                             crate::output::step_info("Falling back to direct repo remove...");
                             repos::remove_repo(name)?;
                             crate::output::result_message(format!("Removed repository '{name}'"));
@@ -804,9 +823,12 @@ impl SpmArgs {
                 crate::fsck::check_integrity(*fix, *files)?;
                 Ok(())
             }
-            SpmCommand::Init { root, from_system, fix_backend } => {
+            SpmCommand::Init { root, from_system, fix_backend, install_daemon } => {
                 let fb = *fix_backend || root.is_some() || *from_system;
                 crate::bootstrap::init_system(root.as_deref(), *from_system, fb)?;
+                if *install_daemon {
+                    crate::bootstrap::install_daemon_service()?;
+                }
                 Ok(())
             }
         }
@@ -844,6 +866,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
     let mut errors: Vec<String> = Vec::new();
 
     // ── Debian packages (sources.debian.org) ──
+    let spinner_deb = crate::output::Spinner::new("Searching Debian...");
     {
         let url = format!("https://sources.debian.org/api/search/{encoded}/");
         match fetch_json(&url, 10) {
@@ -880,9 +903,11 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
             }
             None => errors.push("Debian sources: request failed".into()),
         }
+        spinner_deb.finish();
     }
 
     // ── COPR projects (rpm) ──
+    let spinner_copr = crate::output::Spinner::new("Searching COPR...");
     {
         let url = format!("https://copr.fedorainfracloud.org/api_3/project/search?query={encoded}&limit=20");
         if let Some(val) = fetch_json(&url, 10) {
@@ -901,6 +926,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
         } else {
             errors.push("COPR: request failed".into());
         }
+        spinner_copr.finish();
     }
 
     if results.is_empty() && errors.is_empty() {
@@ -991,9 +1017,9 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
 
             // Check if any configured repo has this package
             let repos_list = repos::load_repos()?;
-            let has_pkg = repos_list.iter().any(|(_, rc)| {
+            let has_pkg = repos_list.iter().any(|(rn, rc)| {
                 matches!(rc.source, crate::types::RepoSource::Apt)
-                    && install::repo_has_package(pkg_name, rc)
+                    && install::repo_has_package(pkg_name, rn, rc)
             });
 
             if !has_pkg {
@@ -1009,9 +1035,9 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
 
                     // Check again after update
                     let repos_list2 = repos::load_repos()?;
-                    let has_pkg2 = repos_list2.iter().any(|(_, rc)| {
+                    let has_pkg2 = repos_list2.iter().any(|(rn, rc)| {
                         matches!(rc.source, crate::types::RepoSource::Apt)
-                            && install::repo_has_package(pkg_name, rc)
+                            && install::repo_has_package(pkg_name, rn, rc)
                     });
 
                     if !has_pkg2 {

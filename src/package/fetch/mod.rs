@@ -563,73 +563,50 @@ fn parse_deb822_entry(text: &str, name: &str) -> Option<HashMap<String, String>>
 
 pub(crate) fn fetch_dnf_to_temp(
     name: &str,
-    repo_name: &str,
-    config: &RepoConfig,
+    _repo_name: &str,
+    _config: &RepoConfig,
     tmp_dir: &str,
 ) -> SpmResult<FetchedPackage> {
-    // Try HTTP direct download — from configured URL or auto-detect from system DNF repos
-    let repo_url = config.url.clone().or_else(|| {
-        let cache_dir = paths::repos_cache_dir().join("dnf").join(repo_name);
-        detect_dnf_baseurl(&cache_dir)
-    });
-    if let Some(ref url) = repo_url {
-        let result = fetch_dnf_http_to_temp(name, repo_name, url, tmp_dir);
-        if result.is_ok() {
-            return result;
-        }
-        tracing::debug!("HTTP direct fetch failed for '{name}' via {url}, falling back to dnf CLI");
-    }
+    let dl_dir = paths::archives_dir().join("dnf-dl");
+    fs::create_dir_all(&dl_dir)?;
 
-    let cache_dir = paths::archives_dir();
-    fs::create_dir_all(&cache_dir)?;
-
-    let output = download::run_with_progress(
+    let dl_output = download::run_with_progress(
         Command::new(crate::util::backend::resolve("dnf"))
-            .args(["repoquery", "--info", name]),
-        &format!("🔍 Searching for '{name}' in dnf repositories"),
-    ).map_err(|e| SpmError::command_failed(format!("Failed to run dnf: {e}. Is dnf available?")))?;
+            .args(["download", "--destdir", &dl_dir.to_string_lossy(), name]),
+        &format!("⬇️  Downloading '{name}' from dnf repositories"),
+    ).map_err(|e| SpmError::command_failed(format!("dnf download failed: {e}. Is dnf available?")))?;
 
-    if !output.status.success() {
+    if !dl_output.status.success() {
+        let stderr = String::from_utf8_lossy(&dl_output.stderr);
         return Err(SpmError::package_not_found(format!(
-            "Package '{name}' not found in dnf repositories"
+            "Package '{name}' not found in dnf repositories: {stderr}"
         )));
     }
 
-    let info = String::from_utf8_lossy(&output.stdout);
-    let mut version = String::new();
-    let mut arch = String::new();
+    let rpm_path = find_rpm_in_dir(&dl_dir, name)
+        .ok_or_else(|| SpmError::other(format!(
+            "dnf downloaded '{name}' but no .rpm file found in output"
+        )))?;
 
-    for line in info.lines() {
-        if let Some(val) = line.split_once(':').map(|x| x.1) {
-            let key = line.split(':').next().unwrap_or("").trim();
-            let value = val.trim();
-            if key == "Version" {
-                version = value.to_string();
-            } else if key == "Architecture" {
-                arch = value.to_string();
-            }
-        }
-    }
-
-    let download_url = resolve_dnf_download_url(name)?;
-    let rpm_filename = format!("{}-{}.{}.rpm", name, version, arch);
-    let rpm_path = cache_dir.join(&rpm_filename);
-    download::retry_download_resumable(&download_url, &rpm_path, name)?;
-    let actual_path = rpm_path.to_string_lossy().to_string();
+    let version = match super::rpm::parse_rpm_header(&rpm_path) {
+        Ok(info) => info.version,
+        Err(_) => "unknown".into(),
+    };
 
     let extracted_dir = format!("{}/root", tmp_dir);
+    fs::create_dir_all(&extracted_dir)?;
+
     let extract_output = Command::new("rpm2cpio")
-        .arg(&actual_path)
+        .arg(&rpm_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| SpmError::command_failed(format!("Failed to run rpm2cpio: {e}")))?;
     if !extract_output.status.success() {
         let stderr = String::from_utf8_lossy(&extract_output.stderr);
-        return Err(SpmError::command_failed(format!(
-            "rpm2cpio failed: {stderr}"
-        )));
+        return Err(SpmError::command_failed(format!("rpm2cpio failed: {stderr}")));
     }
+
     let cpio = Command::new("cpio")
         .args(["-idmv", "-D", &extracted_dir])
         .stdin(Stdio::piped())
@@ -649,7 +626,7 @@ pub(crate) fn fetch_dnf_to_temp(
         return Err(SpmError::command_failed("cpio extraction failed".to_string()));
     }
 
-    let scripts = super::scripts::extract_rpm_scripts(&actual_path)?;
+    let scripts = super::scripts::extract_rpm_scripts(&rpm_path)?;
 
     Ok(FetchedPackage {
         extracted_dir,
@@ -676,108 +653,20 @@ pub(crate) fn fetch_dnf_to_temp(
     })
 }
 
-/// Scan cached DNF repo config files for a baseurl to use for HTTP direct download
-fn detect_dnf_baseurl(cache_dir: &Path) -> Option<String> {
-    let dir = cache_dir.to_path_buf();
-    if !dir.is_dir() {
-        return None;
-    }
-    for entry in std::fs::read_dir(&dir).ok()? {
+fn find_rpm_in_dir(dir: &Path, name: &str) -> Option<String> {
+    for entry in fs::read_dir(dir).ok()? {
         let entry = entry.ok()?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("repo") {
+        if path.extension().and_then(|e| e.to_str()) != Some("rpm") {
             continue;
         }
-        let content = std::fs::read_to_string(&path).ok()?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(val) = trimmed.strip_prefix("baseurl=") {
-                let url = val.trim().trim_matches('"');
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    return Some(url.to_string());
-                }
-            }
+        let fname = path.file_name().and_then(|n| n.to_str())?;
+        if fname.starts_with(name) || fname.contains(&format!("/{name}-")) {
+            return path.to_str().map(|s| s.to_string());
         }
     }
     None
 }
-
-fn fetch_dnf_http_to_temp(
-    name: &str,
-    repo_name: &str,
-    repo_url: &str,
-    tmp_dir: &str,
-) -> SpmResult<FetchedPackage> {
-    tracing::debug!("Fetching '{name}' via HTTP from RPM-MD repo {repo_url}");
-
-    let rpm_bytes = crate::package::fetch::gs::download_rpm_from_repo(repo_url, name)?;
-
-    let extracted_dir = format!("{}/root", tmp_dir);
-    fs::create_dir_all(&extracted_dir)?;
-
-    let cache_dir = paths::archives_dir();
-    fs::create_dir_all(&cache_dir)?;
-    let rpm_path = cache_dir.join(format!("{name}.rpm"));
-    fs::write(&rpm_path, &rpm_bytes)?;
-
-    let extract_output = Command::new("rpm2cpio")
-        .arg(&rpm_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run rpm2cpio: {e}")))?;
-    if !extract_output.status.success() {
-        return Err(SpmError::command_failed("rpm2cpio extraction failed"));
-    }
-    let mut cpio = Command::new("cpio")
-        .args(["-idmv", "-D", &extracted_dir])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| SpmError::command_failed(format!("Failed to spawn cpio: {e}")))?;
-    if let Some(mut stdin) = cpio.stdin.take() {
-        stdin.write_all(&extract_output.stdout)
-            .map_err(|e| SpmError::other(format!("Failed to pipe to cpio: {e}")))?;
-    }
-    let cpio_status = cpio.wait_with_output()
-        .map_err(|e| SpmError::command_failed(format!("cpio failed: {e}")))?;
-    if !cpio_status.status.success() {
-        return Err(SpmError::command_failed("cpio extraction failed"));
-    }
-
-    let scripts = super::scripts::extract_rpm_scripts(&rpm_path.to_string_lossy())?;
-
-    let version = match super::rpm::parse_rpm_header(&rpm_path.to_string_lossy()) {
-        Ok(pkg) => pkg.version,
-        Err(_) => "unknown".into(),
-    };
-
-    Ok(FetchedPackage {
-        extracted_dir,
-        files: Vec::new(),
-        manifest: Manifest {
-            name: name.to_string(),
-            version: version.clone(),
-            ..Manifest::default()
-        },
-        pkg: InstalledPackage {
-            name: name.to_string(),
-            version,
-            format: PackageFormat::Rpm,
-            install_type: InstallType::Native,
-            manifest: None,
-            install_date: Utc::now().to_rfc3339(),
-            source_repo: Some(format!("dnf-http:{}", repo_name)),
-            store_hash: None,
-            origin: InstallOrigin::Spm,
-        },
-        conflicting_packages: Vec::new(),
-        scripts,
-        _tmp_dir: None,
-    })
-}
-
 pub(crate) fn fetch_native_to_temp(
     name: &str,
     _repo_name: &str,
@@ -844,31 +733,6 @@ pub(crate) fn fetch_native_to_temp(
         scripts,
         _tmp_dir: None,
     })
-}
-
-fn resolve_dnf_download_url(name: &str) -> SpmResult<String> {
-    let output = Command::new(crate::util::backend::resolve("dnf"))
-        .args(["download", "--urls", name])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("dnf download --urls failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::other(format!(
-            "dnf could not resolve download URL for '{name}': {stderr}"
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.starts_with("http://") || line.starts_with("https://") {
-            return Ok(line.to_string());
-        }
-    }
-    Err(SpmError::other(format!(
-        "Could not parse download URL for '{name}' from dnf output:\n{stdout}"
-    )))
 }
 
 pub(crate) fn fetch_local_to_temp(path_str: &str, tmp_dir: &str) -> SpmResult<FetchedPackage> {

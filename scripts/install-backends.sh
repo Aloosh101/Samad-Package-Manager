@@ -16,12 +16,12 @@ set -euo pipefail
 
 SPM_BACKEND_DIR="${SPM_BACKEND_DIR:-/usr/libexec/spm/backend}"
 
-# Detect distribution type
+# Detect distribution type — RPM first because dpkg can exist on RPM systems
 detect_distro() {
-    if command -v dpkg &>/dev/null; then
-        echo "deb"
-    elif command -v rpm &>/dev/null; then
+    if command -v rpm &>/dev/null; then
         echo "rpm"
+    elif command -v dpkg &>/dev/null; then
+        echo "deb"
     else
         echo "unknown"
     fi
@@ -32,13 +32,15 @@ install_backend() {
     local src="$2"
     local dst="$SPM_BACKEND_DIR/$name"
 
-    if [ ! -f "$src" ]; then
+    if [ ! -f "$src" ] && [ ! -L "$src" ]; then
         echo "  ⚠ $name: not found at $src, skipping"
         return 1
     fi
 
-    mkdir -p "$(dirname "$dst")"
-    cp -f "$src" "$dst"
+    mkdir -p "$SPM_BACKEND_DIR"
+    # Remove any existing symlink or file at destination first
+    rm -f "$dst"
+    cp -fL "$src" "$dst"
     chmod 755 "$dst"
     echo "  ✓ $name → $dst"
 }
@@ -47,7 +49,7 @@ install_rpm_backends() {
     echo "Installing RPM/DNF backends..."
 
     install_backend "dnf"       "/usr/bin/dnf"       || true
-    install_backend "dnf"       "/usr/bin/dnf-3"     || true  # RHEL9+ alternative
+    install_backend "dnf"       "/usr/bin/dnf-3"     || true  # RHEL9+ / openSUSE alternative
     install_backend "rpm"       "/usr/bin/rpm"
     install_backend "rpm2cpio"  "/usr/bin/rpm2cpio"  || true
     install_backend "cpio"      "/usr/bin/cpio"      || true
@@ -56,6 +58,24 @@ install_rpm_backends() {
     if [ ! -f "$SPM_BACKEND_DIR/dnf" ] && [ -f "$SPM_BACKEND_DIR/dnf-3" ]; then
         ln -sf dnf-3 "$SPM_BACKEND_DIR/dnf"
         echo "  ✓ dnf → symlink to dnf-3"
+    fi
+
+    # openSUSE: rpm2cpio is a symlink to rpm2archive — write a proper wrapper
+    local r2c="$SPM_BACKEND_DIR/rpm2cpio"
+    rm -f "$r2c" "$SPM_BACKEND_DIR/rpm2archive"
+    if command -v rpm2archive &>/dev/null && rpm2archive --help 2>&1 | grep -q '\-\-format'; then
+        cp -fL "$(command -v rpm2archive)" "$SPM_BACKEND_DIR/rpm2archive"
+        chmod 755 "$SPM_BACKEND_DIR/rpm2archive"
+        echo "  ✓ rpm2archive → $SPM_BACKEND_DIR/rpm2archive"
+        # Wrapper: rpm2cpio <rpm> → cpio on stdout (via rpm2archive --format=cpio)
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            '# Wrapper: rpm2cpio via rpm2archive --format=cpio' \
+            'exec rpm2archive --format=cpio "$1"' > "$r2c"
+        chmod 755 "$r2c"
+        echo "  ✓ rpm2cpio → wrapper (rpm2archive --format=cpio)"
+    else
+        echo "  ⚠ rpm2cpio: cannot create wrapper (rpm2archive not found/too old)"
     fi
 
     # Try extra locations for cpio

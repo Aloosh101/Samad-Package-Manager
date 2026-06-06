@@ -17,6 +17,28 @@ SPM is a cross-distro package manager for Linux. It is built on two convictions:
 
 ---
 
+## Quick Start
+
+```bash
+git clone https://github.com/aloosh101/spm && cd spm
+cargo build --release
+sudo ./install.sh --root         # system-wide: binaries + backends + daemon + man
+```
+
+Or without root:
+
+```bash
+cargo build --release
+./install.sh --user              # ~/.local/share/spm, no daemon
+```
+
+After root install, the daemon runs automatically:
+
+```bash
+systemctl status spmd            # should be active (running)
+spm install figlet               # test it
+```
+
 ## Table of Contents
 
 - [The Heist: What SPM Steals and Why](#the-heist-what-spm-steals-and-why)
@@ -418,9 +440,9 @@ untouched.
 
 ## Project Status
 
-**38/38 issues closed ✅ — 404 tests passing — 0 compiler warnings**
+**399 unit tests passing ✅ — 0 compiler warnings — 0 clippy warnings**
 
-SPM is in its 0.1.0 release. All security vulnerabilities (H8, H9, C6),
+SPM is in its 0.1.2 release. All security vulnerabilities (H8, H9, C6),
 code quality issues (M11, M12, M13), and documentation gaps have been resolved.
 The codebase produces zero warnings with default Rust compiler settings.
 
@@ -439,9 +461,9 @@ went from concept to a fully tested, documented, and security-audited package
 manager with:
 
 - 25 CLI commands
-- 404 passing tests
+- 399 unit tests passing
 - 0 compiler warnings
-- 38/38 issues closed
+- systemd service installation (spm init --install-daemon)
 - SELinux policy integration
 - systemd socket activation
 - Namespace sandboxing

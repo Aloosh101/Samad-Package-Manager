@@ -1,9 +1,9 @@
-.TH SPM\-INIT 8 "June 2026" "spm 0.1.0" "System Manager's Manual"
+.TH SPM\-INIT 8 "June 2026" "spm 0.1.2" "System Manager's Manual"
 .SH NAME
 spm\-init \- Initialize spm directory structure, database, and backends
 .SH SYNOPSIS
 .B spm init
-[\fB\-\-root\fR=\fIpath\fR] [\fB\-\-from-system\fR] [\fB\-\-fix-backend\fR]
+[\fB\-\-root\fR=\fIpath\fR] [\fB\-\-from-system\fR] [\fB\-\-fix-backend\fR] [\fB\-\-install-daemon\fR]
 .SH DESCRIPTION
 Initialize the spm runtime environment.  \fBspm init\fR creates the
 necessary directory structure, sets up the SQLite database with the
@@ -43,6 +43,12 @@ Reinstall backend binaries from the bundled directory
 (\fB/var/lib/spm/store/backend/\fR).  This fixes cases where backend
 binaries have been accidentally removed or corrupted.  Automatically
 enabled when \fB\-\-root\fR or \fB\-\-from-system\fR is used.
+.TP
+\fB\-\-install-daemon\fR
+Install the \fBspmd\fR systemd service unit and start the daemon.
+Writes \fB/etc/systemd/system/spmd.service\fR, runs
+\fBsystemctl daemon-reload\fR, \fBsystemctl enable spmd\fR,
+and \fBsystemctl start spmd\fR.  Requires root privileges.
 .SH FILES
 .TP
 \fB/var/lib/spm/metadata.db\fR
@@ -75,6 +81,9 @@ Initialize and import all existing packages.
 .IP \(bu 2
 \fBspm init \-\-root /mnt/chroot\fR
 Initialize spm for a chroot environment.
+.IP \(bu 2
+\fBspm init \-\-install-daemon\fR
+Install spmd systemd service and start the daemon.
 .SH SEE ALSO
 .BR spm (8),
 .BR spm\-sync (8),

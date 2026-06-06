@@ -75,7 +75,7 @@ pub fn install_package_smart(
     let repos_list = repos::load_repos()?;
     let candidates: Vec<&(String, RepoConfig)> = repos_list
         .iter()
-        .filter(|(_, rc)| repo_has_package(name, rc))
+        .filter(|(rn, rc)| repo_has_package(name, rn, rc))
         .collect();
 
     if candidates.is_empty() {
@@ -221,12 +221,11 @@ pub fn install_package_from_repo(name: &str, source: RepoSource, replace: bool, 
     ensure_dirs()?;
 
     let repos_list = repos::load_repos()?;
-    let repo_cfg = repos_list.iter()
+    let (repo_name, repo_cfg) = repos_list.iter()
         .find(|(_, rc)| rc.source == source)
-        .map(|(_, rc)| rc)
         .ok_or_else(|| SpmError::config(format!("No {} repository configured", source)))?;
 
-    if !repo_has_package(name, repo_cfg) {
+    if !repo_has_package(name, repo_name, repo_cfg) {
         return Err(SpmError::package_not_found(format!(
             "Package '{name}' not found in {} repository", source,
         )));
@@ -273,7 +272,7 @@ pub fn install_package_from_repo(name: &str, source: RepoSource, replace: bool, 
 
 
 
-pub(crate) fn repo_has_package(name: &str, repo_config: &RepoConfig) -> bool {
+pub(crate) fn repo_has_package(name: &str, repo_name: &str, repo_config: &RepoConfig) -> bool {
     match repo_config.source {
         RepoSource::Apt => {
             let has_apt_cache = Command::new(crate::util::backend::resolve("apt-cache"))
@@ -326,7 +325,17 @@ pub(crate) fn repo_has_package(name: &str, repo_config: &RepoConfig) -> bool {
                 .ok()
                 .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
         }
-        RepoSource::Native => true,
+        RepoSource::Native => {
+            // Check the cached repo index for the package
+            let cache_dir = crate::config::paths::repos_cache_dir().join("native").join(repo_name);
+            let index_path = cache_dir.join("repo-index.json");
+            if let Ok(content) = fs::read_to_string(&index_path) {
+                if let Ok(index) = serde_json::from_str::<crate::types::RepoIndex>(&content) {
+                    return index.packages.iter().any(|p| p.name == name);
+                }
+            }
+            false
+        }
     }
 }
 

@@ -1,4 +1,7 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 use chrono::Utc;
 
@@ -91,10 +94,10 @@ pub fn init_system(root: Option<&str>, from_system: bool, fix_backend: bool) -> 
             .ok()
             .is_some_and(|s| s.success());
 
-        let (system_pkgs, pkg_format): (Vec<(String, String)>, PackageFormat) = if has_dpkg {
-            (query_dpkg_packages(), PackageFormat::Deb)
-        } else if has_rpm {
+        let (system_pkgs, pkg_format): (Vec<(String, String)>, PackageFormat) = if has_rpm {
             (query_rpm_packages(), PackageFormat::Rpm)
+        } else if has_dpkg {
+            (query_dpkg_packages(), PackageFormat::Deb)
         } else {
             (Vec::new(), PackageFormat::Sam)
         };
@@ -266,4 +269,74 @@ fn query_rpm_packages() -> Vec<(String, String)> {
         }
     }
     packages
+}
+
+/// Install the spmd systemd service unit for daemon-based operations.
+/// This requires root (to write to /etc/systemd/system/) and a running
+/// systemd.  Called from `spm init --install-daemon`.
+pub fn install_daemon_service() -> SpmResult<()> {
+    let service_path = Path::new("/etc/systemd/system/spmd.service");
+
+    // Only write if not already present (don't overwrite user modifications)
+    // or if the unit is outdated (missing ProtectSystem=full, or has old ProtectHome=yes)
+    let needs_write = if service_path.exists() {
+        let existing = fs::read_to_string(service_path).unwrap_or_default();
+        !existing.contains("ProtectSystem=full") || existing.contains("ProtectHome=yes")
+    } else {
+        true
+    };
+
+    if needs_write {
+        let unit = r#"[Unit]
+Description=SPM Daemon — privileged package operations
+Documentation=man:spmd(8)
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spmd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+ProtectSystem=full
+ReadWritePaths=/var/lib/spm /var/cache/spm /etc/spm
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+        fs::write(service_path, unit)
+            .map_err(|e| SpmError::other(format!("Cannot write {service_path:?}: {e}")))?;
+
+        // 0644 — world-readable, root-writable (standard for systemd units)
+        fs::set_permissions(service_path, fs::Permissions::from_mode(0o644))
+            .map_err(|e| SpmError::other(format!("Cannot set permissions on {service_path:?}: {e}")))?;
+
+        crate::output::step_success(format!("Wrote systemd unit: {service_path:?}"));
+    } else {
+        crate::output::step_info("spmd.service already installed");
+    }
+
+    // Reload systemd, enable, start
+    let steps: &[(&str, &[&str], &str)] = &[
+        ("systemctl", &["daemon-reload"], "systemd daemon-reload"),
+        ("systemctl", &["enable", "spmd"], "enable spmd"),
+        ("systemctl", &["start", "spmd"], "start spmd"),
+    ];
+    for (cmd, args, label) in steps {
+        let output = Command::new(cmd)
+            .args(*args)
+            .output()
+            .map_err(|e| SpmError::command_failed(format!("{label} failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            crate::output::step_warn(format!("{label} failed: {stderr}"));
+        } else {
+            crate::output::step_success(format!("{label}"));
+        }
+    }
+
+    crate::output::result_message("spmd daemon service installed and started");
+    Ok(())
 }
