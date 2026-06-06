@@ -54,6 +54,10 @@ pub fn send_purge_request(package: &str) -> SpmResult<String> {
     send_action_request("purge", Some(package.to_string()))
 }
 
+pub fn send_autoremove_request(yes: bool) -> SpmResult<String> {
+    send_action_request("autoremove", Some(yes.to_string()))
+}
+
 pub fn send_cleanup_request() -> SpmResult<String> {
     send_action_request("cleanup", None)
 }

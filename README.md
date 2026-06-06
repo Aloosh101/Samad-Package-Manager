@@ -442,7 +442,7 @@ untouched.
 
 **399 unit tests passing ✅ — 0 compiler warnings — 0 clippy warnings**
 
-SPM is in its 0.1.2 release. All security vulnerabilities (H8, H9, C6),
+SPM is in its 0.1.3 release. All security vulnerabilities (H8, H9, C6),
 code quality issues (M11, M12, M13), and documentation gaps have been resolved.
 The codebase produces zero warnings with default Rust compiler settings.
 

@@ -10,7 +10,7 @@ use crate::types::SpmConfig;
 use crate::util::process;
 
 #[derive(Parser, Debug)]
-#[command(name = "spm", version = "0.1.2", about = "Samad Package Manager")]
+#[command(name = "spm", version = "0.1.3", about = "Samad Package Manager")]
 pub struct SpmArgs {
     #[command(subcommand)]
     pub command: SpmCommand,
@@ -18,7 +18,7 @@ pub struct SpmArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SpmCommand {
-    /// Install a package
+    /// Install a package (i)
     #[command(alias = "i",
         after_help = "Examples:\n  spm install nginx               Install from repos\n  spm install ./pkg.deb            Install local .deb\n  spm install --sandbox nginx      Sandboxed install\n  spm install --smart nginx        RPATH library isolation\n  spm install -y nginx             Non-interactive\n  spm install --replace nginx      Reinstall or replace conflicts\n  spm install --stable-debian nginx  Stable from Debian repos\n  spm install --newest-redhat nginx  Newest from RedHat repos\n  spm install --prefer-newest nginx  Prefer newest regardless of distro"
     )]
@@ -51,7 +51,7 @@ pub enum SpmCommand {
         newest_redhat: bool,
     },
 
-    /// Remove a package
+    /// Remove a package (r)
     #[command(alias = "r",
         after_help = "Examples:\n  spm remove nginx         Remove nginx\n  spm remove -y nginx      Non-interactive removal"
     )]
@@ -63,7 +63,7 @@ pub enum SpmCommand {
         yes: bool,
     },
 
-    /// Remove a package along with its configuration files
+    /// Remove a package along with its configuration files (p)
     #[command(alias = "p",
         after_help = "Examples:\n  spm purge nginx          Remove nginx including config files"
     )]
@@ -82,13 +82,13 @@ pub enum SpmCommand {
         yes: bool,
     },
 
-    /// Fetch the latest repository metadata from all sources
+    /// Fetch the latest repository metadata from all sources (u)
     #[command(alias = "u",
         after_help = "Examples:\n  spm update                Fetch latest repo metadata"
     )]
     Update,
 
-    /// Upgrade all packages (or a single package) to the latest version
+    /// Upgrade all packages (or a single package) to the latest version (upg)
     #[command(alias = "upg",
         after_help = "Examples:\n  spm upgrade                   Upgrade all packages\n  spm upgrade nginx              Upgrade only nginx\n  spm upgrade --prefer-newest    Prefer newest regardless of distro\n  spm upgrade --stable-debian    Stable from Debian repos\n  spm upgrade --newest-redhat    Newest from RedHat repos"
     )]
@@ -116,7 +116,7 @@ pub enum SpmCommand {
         yes: bool,
     },
 
-    /// Search configured repositories for packages
+    /// Search configured repositories for packages (s)
     #[command(alias = "s",
         after_help = "Examples:\n  spm search nginx         Search repos for nginx\n  spm search lib           Search for 'lib' packages"
     )]
@@ -125,7 +125,7 @@ pub enum SpmCommand {
         query: String,
     },
 
-    /// Search remote repositories (Debian, COPR) for a package
+    /// Search remote repositories (Debian, COPR) for a package (gs)
     #[command(alias = "gs", name = "global-search",
         after_help = "Examples:\n  spm global-search nginx  Search Debian + COPR for nginx\n  spm global-search -y nginx  Non-interactive, show results only"
     )]
@@ -146,7 +146,7 @@ pub enum SpmCommand {
         path: String,
     },
 
-    /// Show detailed information about an installed package
+    /// Show detailed information about an installed package (show)
     #[command(alias = "show",
         after_help = "Examples:\n  spm info nginx           Show details about installed nginx\n  spm info figlet          Show package metadata"
     )]
@@ -155,7 +155,7 @@ pub enum SpmCommand {
         package: String,
     },
 
-    /// List files owned by an installed package
+    /// List files owned by an installed package (ls)
     #[command(alias = "ls",
         after_help = "Examples:\n  spm files nginx           List all files owned by nginx"
     )]
@@ -164,35 +164,35 @@ pub enum SpmCommand {
         package: String,
     },
 
-    /// Show direct dependencies of a package
+    /// Show direct dependencies of a package (deps)
     #[command(alias = "deps")]
     Depends {
         /// Name of the installed package
         package: String,
     },
 
-    /// Show packages that depend on the given package
+    /// Show packages that depend on the given package (rdeps)
     #[command(alias = "rdeps")]
     Rdepends {
         /// Name of the installed package
         package: String,
     },
 
-    /// View transaction history or undo a past transaction
+    /// View transaction history or undo a past transaction (log)
     #[command(alias = "log")]
     History {
         /// Transaction ID to undo (omit to show history)
         undo: Option<i64>,
     },
 
-    /// Create or rollback Btrfs snapshots
+    /// Create or rollback Btrfs snapshots (snap)
     #[command(alias = "snap")]
     Snapshot {
         #[command(subcommand)]
         action: SnapshotAction,
     },
 
-    /// Analyze the system for orphans, conflicts, or file traces
+    /// Analyze the system for orphans, conflicts, or file traces (an)
     #[command(alias = "an")]
     Analyze {
         #[command(subcommand)]
@@ -210,7 +210,7 @@ pub enum SpmCommand {
         action: SandboxAction,
     },
 
-    /// Add, list, or remove package repositories
+    /// Add, list, or remove package repositories (repository)
     #[command(alias = "repository",
         after_help = "Examples:\n  spm repo add debian --source apt --mirror http://deb.debian.org/debian\n  spm repo list\n  spm repo remove myrepo\n  spm repo gen-key myrepo         Generate Ed25519 signing key\n  spm repo sign myrepo            Sign Release file with key"
     )]
@@ -236,7 +236,7 @@ pub enum SpmCommand {
         install: bool,
     },
 
-    /// Build a .sam package from source
+    /// Build a .sam package from source (b)
     #[command(alias = "b",
         after_help = "Examples:\n  spm build                   Build package from current directory\n  spm build ./myapp          Build package from ./myapp directory\n  spm build --output ./dist  Write .sam to ./dist/\n  spm build --sign KEY_ID    Sign package with GPG key"
     )]
@@ -340,7 +340,7 @@ pub enum AnalyzeMode {
 pub enum SandboxAction {
     /// List all sandboxed packages
     List,
-    /// Run a command inside a sandboxed package's environment
+    /// Run a command inside a sandboxed package's environment (exec)
     #[command(alias = "exec")]
     Run {
         /// Name of the sandboxed package
@@ -699,15 +699,54 @@ impl SpmArgs {
             },
 
             SpmCommand::Remove { package, yes: _ } => {
-                install::remove_package(package)?;
+                match client::send_remove_by_name_request(package) {
+                    Ok(msg) => println!("{}", msg),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.starts_with("Cannot connect to spmd") {
+                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                            crate::output::step_info("Falling back to direct removal...");
+                            install::remove_package(package)?;
+                        } else {
+                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
+                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
+                        }
+                    }
+                }
                 Ok(())
             }
             SpmCommand::Purge { package } => {
-                install::purge_package(package)?;
+                match client::send_purge_request(package) {
+                    Ok(msg) => println!("{}", msg),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.starts_with("Cannot connect to spmd") {
+                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                            crate::output::step_info("Falling back to direct purge...");
+                            install::purge_package(package)?;
+                        } else {
+                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
+                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
+                        }
+                    }
+                }
                 Ok(())
             }
             SpmCommand::Autoremove { yes } => {
-                install::autoremove_packages(*yes)?;
+                match client::send_autoremove_request(*yes) {
+                    Ok(msg) => println!("{}", msg),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.starts_with("Cannot connect to spmd") {
+                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
+                            crate::output::step_info("Falling back to direct autoremove...");
+                            install::autoremove_packages(*yes)?;
+                        } else {
+                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
+                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
+                        }
+                    }
+                }
                 Ok(())
             }
             SpmCommand::Update => {

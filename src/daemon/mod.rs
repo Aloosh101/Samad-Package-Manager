@@ -236,6 +236,13 @@ impl RateLimiter {
                     Err(SpmError::permission_denied("Only root or 'spm' group can purge packages"))
                 }
             }
+            "autoremove" => {
+                if authorized {
+                    handle_autoremove(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can autoremove packages"))
+                }
+            }
             "cleanup" => {
                 if authorized {
                     handle_cleanup().await
@@ -519,6 +526,16 @@ async fn handle_purge(req: &DaemonRequest) -> Result<String, SpmError> {
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Purge failed: {e}")))?;
     Ok(format!("Purged {package}"))
+}
+
+async fn handle_autoremove(req: &DaemonRequest) -> Result<String, SpmError> {
+    let yes = req.package.as_deref().and_then(|v| v.parse::<bool>().ok()).unwrap_or(false);
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::package::install::autoremove_packages(yes)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Autoremove failed: {e}")))?;
+    Ok("Autoremove completed".to_string())
 }
 
 async fn handle_cleanup() -> Result<String, SpmError> {
