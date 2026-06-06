@@ -5,6 +5,8 @@ use std::process::Command;
 use crate::config::paths;
 use crate::error::{SpmError, SpmResult};
 
+pub mod desktop;
+
 pub fn list_sandboxes() -> SpmResult<()> {
     let sandbox_dir = paths::sandboxes_dir();
     if !sandbox_dir.exists() {

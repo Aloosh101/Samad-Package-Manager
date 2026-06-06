@@ -97,6 +97,8 @@ pub fn remove_package(name: &str) -> SpmResult<()> {
 
     // Phase 4: Remove sandbox directory if applicable
     if matches!(pkg.install_type, InstallType::Sandbox) {
+        let _ = crate::sandbox::desktop::remove_sandbox_desktop_entries(name);
+
         let sandbox_dir = paths::sandbox_dir(name);
         if sandbox_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&sandbox_dir) {
@@ -189,7 +191,10 @@ pub fn purge_package(name: &str) -> SpmResult<()> {
         }
     }
 
-    // 3c: Sandbox directory
+    // 3c: Sandbox desktop entries
+    let _ = crate::sandbox::desktop::remove_sandbox_desktop_entries(name);
+
+    // 3d: Sandbox directory
     let sandbox_dir = paths::sandbox_dir(name);
     if sandbox_dir.exists() {
         if let Err(e) = fs::remove_dir_all(&sandbox_dir) {
@@ -197,7 +202,7 @@ pub fn purge_package(name: &str) -> SpmResult<()> {
         }
     }
 
-    // 3d: Scripts directory
+    // 3e: Scripts directory
     crate::package::scripts::remove_scripts(name).unwrap_or_else(|e| {
         remove_errors.push(format!("  scripts: {e}"));
     });

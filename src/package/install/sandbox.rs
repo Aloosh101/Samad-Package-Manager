@@ -150,6 +150,8 @@ pub(super) fn install_sandboxed(name: &str, level: &str, conn: &rusqlite::Connec
                 }
             }
 
+            let _ = crate::sandbox::desktop::create_sandbox_desktop_entries(name, &sandbox_dir);
+
             crate::output::step_success(format!("Sandbox '{}' set up ({level})", name));
             Ok(())
         }
