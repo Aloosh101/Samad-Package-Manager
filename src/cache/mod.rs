@@ -94,7 +94,7 @@ pub fn user_spm_dir(user_home: &str) -> PathBuf {
 }
 
 pub fn user_bin_dir(user_home: &str) -> PathBuf {
-    user_spm_dir(user_home).join("bin")
+    PathBuf::from(user_home).join(".local").join("bin")
 }
 
 pub fn user_lib_dir(user_home: &str) -> PathBuf {
@@ -181,7 +181,7 @@ pub fn create_user_symlinks(hash: &str, user_home: &str) -> SpmResult<Vec<String
             let src = entry.path();
             let dest = bin_dir.join(&name_str);
 
-            if dest.exists() {
+            if dest.exists() || dest.is_symlink() {
                 let _ = fs::remove_file(&dest);
             }
             std::os::unix::fs::symlink(&src, &dest)?;
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn test_user_bin_dir() {
         let d = user_bin_dir("/home/user");
-        assert_eq!(d, PathBuf::from("/home/user/.local/share/spm/bin"));
+        assert_eq!(d, PathBuf::from("/home/user/.local/bin"));
     }
 
     #[test]

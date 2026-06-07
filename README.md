@@ -25,14 +25,14 @@ cargo build --release
 sudo ./install.sh --root         # system-wide: binaries + backends + daemon + man
 ```
 
-Or without root:
+Or with sudo for daemon, user binary at ~/.local:
 
 ```bash
 cargo build --release
-./install.sh --user              # ~/.local/share/spm, no daemon
+./install.sh --user              # spm → ~/.local/bin, daemon installed via sudo
 ```
 
-After root install, the daemon runs automatically:
+After install, the daemon runs automatically:
 
 ```bash
 systemctl status spmd            # should be active (running)
@@ -177,13 +177,13 @@ directly from the kernel's socket data structure — **no race condition, no tok
 no password, no TOCTOU vulnerability.**
 
 | Feature | Implementation |
-|---|---|
-| Socket path | `/run/spm/spmd.sock` (respects `$SPM_ROOT`) |
+|---|---|---|
+| Socket path | `/run/spm.sock` |
 | Rate limiting | 10 requests/second per user |
 | Concurrency | 3 concurrent operations per user |
 | Socket activation | systemd `LISTEN_FDS`/`LISTEN_PID` |
 | State recovery | Graceful degradation on SIGTERM/SIGINT |
-| Fallback | CLI executes directly when daemon is down |
+| Auto-start | CLI starts daemon via `systemctl start spmd` (pkexec/sudo) when missing |
 
 ---
 

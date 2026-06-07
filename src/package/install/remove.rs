@@ -49,6 +49,7 @@ fn dirs_to_cleanup(name: &str, file_records: &[FileRecord]) -> Vec<String> {
 
 pub fn remove_package(name: &str) -> SpmResult<()> {
     crate::output::section(format!("🗑 Removing {}", name));
+    let mut spinner = crate::output::Spinner::new(format!("Preparing to remove '{name}'..."));
 
     // Phase 1: Read package info (read lock)
     let (pkg, file_records, scripts) = db::with_read_lock(|conn| {
@@ -74,6 +75,7 @@ pub fn remove_package(name: &str) -> SpmResult<()> {
         .unwrap_or_default();
 
     // Phase 3: Physically remove files (skip conffiles — they persist on remove)
+    spinner.message(&format!("Removing {} files", file_records.len()));
     let mut remove_errors: Vec<String> = Vec::new();
     for f in &file_records {
         if is_conffile(&f.filepath, &conffiles) {
@@ -87,6 +89,7 @@ pub fn remove_package(name: &str) -> SpmResult<()> {
                     if let Some(parent) = path.parent() {
                         let _ = fs::remove_dir(parent);
                     }
+                    spinner.message(&f.filepath);
                 }
                 Err(e) => {
                     remove_errors.push(format!("  {}: {e}", f.filepath));
@@ -97,6 +100,7 @@ pub fn remove_package(name: &str) -> SpmResult<()> {
 
     // Phase 4: Remove sandbox directory if applicable
     if matches!(pkg.install_type, InstallType::Sandbox) {
+        spinner.message("Removing sandbox...");
         let _ = crate::sandbox::desktop::remove_sandbox_desktop_entries(name);
 
         let sandbox_dir = paths::sandbox_dir(name);
@@ -109,6 +113,7 @@ pub fn remove_package(name: &str) -> SpmResult<()> {
 
     // Phase 5: Verify 100% physical deletion before touching DB
     if !remove_errors.is_empty() {
+        spinner.finish();
         return Err(format_remove_failed_msg(name, "remove", &remove_errors));
     }
 

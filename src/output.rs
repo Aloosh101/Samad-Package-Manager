@@ -1,4 +1,48 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+static PROGRESS_TX: LazyLock<Mutex<HashMap<u32, mpsc::Sender<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn set_progress_tx(uid: u32, tx: mpsc::Sender<String>) {
+    if let Ok(mut guard) = PROGRESS_TX.lock() {
+        guard.insert(uid, tx);
+    }
+}
+
+pub fn clear_progress_tx(uid: u32) {
+    if let Ok(mut guard) = PROGRESS_TX.lock() {
+        guard.remove(&uid);
+    }
+}
+
+fn send_progress(uid: u32, msg: String) {
+    if let Ok(guard) = PROGRESS_TX.lock() {
+        if let Some(ref tx) = guard.get(&uid) {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+static CURRENT_UID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
+
+pub fn set_current_uid(uid: u32) {
+    if let Ok(mut guard) = CURRENT_UID.lock() {
+        *guard = Some(uid);
+    }
+}
+
+pub fn clear_current_uid() {
+    if let Ok(mut guard) = CURRENT_UID.lock() {
+        *guard = None;
+    }
+}
+
+fn current_uid() -> Option<u32> {
+    CURRENT_UID.lock().ok().and_then(|g| *g)
+}
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -62,16 +106,30 @@ pub fn magenta(text: impl std::fmt::Display) -> String {
     colored(MAGENTA, text)
 }
 
+fn clean_msg(msg: &str) -> String {
+    msg.replace('\n', " ").replace('\r', "")
+}
+
+fn send_msg(msg: impl std::fmt::Display) {
+    let s = clean_msg(&msg.to_string());
+    if let Some(uid) = current_uid() {
+        send_progress(uid, s);
+    }
+}
+
 pub fn section(title: impl std::fmt::Display) {
-    eprintln!("\n  {} {}", bold(cyan("──")), bold(title));
+    eprintln!("\n  {} {}", bold(cyan("──")), bold(&title));
+    send_msg(format!("section: {title}"));
 }
 
 pub fn step_success(msg: impl std::fmt::Display) {
-    eprintln!("  {} {}", green("✔"), msg);
+    eprintln!("  {} {}", green("✔"), &msg);
+    send_msg(format!("success: {msg}"));
 }
 
 pub fn step_info(msg: impl std::fmt::Display) {
-    eprintln!("  {} {}", blue("ℹ"), msg);
+    eprintln!("  {} {}", blue("ℹ"), &msg);
+    send_msg(format!("info: {msg}"));
 }
 
 pub fn step_warn(msg: impl std::fmt::Display) {
@@ -165,21 +223,38 @@ pub fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Lightweight spinner for showing subprocess output line-by-line.
 pub struct Spinner {
     message: String,
+    spin: usize,
 }
+
+const SPINNER_CHARS: &[u8] = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".as_bytes();
 
 impl Spinner {
     pub fn new(message: impl Into<String>) -> Self {
         let msg = message.into();
-        if is_color_terminal() {
-            eprint!("  ⠋ {}       \r", msg);
+        Self::print_frame(0, &msg);
+        send_msg(&msg);
+        Spinner { message: msg, spin: 1 }
+    }
+
+    pub fn tick(&mut self) {
+        let ch = SPINNER_CHARS[self.spin % SPINNER_CHARS.len()] as char;
+        let max = 80usize.saturating_sub(4);
+        let truncated = if self.message.len() > max {
+            format!("{}…", &self.message[..max.saturating_sub(1)])
         } else {
-            eprint!("  {}       \r", msg);
+            self.message.clone()
+        };
+        if is_color_terminal() {
+            eprint!("  {} {}       \r", ch, truncated);
+        } else {
+            eprint!("  {}       \r", truncated);
         }
-        Spinner { message: msg }
+        self.spin = (self.spin + 1) % SPINNER_CHARS.len();
     }
 
     pub fn message(&mut self, text: &str) {
         self.message = text.to_string();
+        let ch = SPINNER_CHARS[self.spin % SPINNER_CHARS.len()] as char;
         let max = 80usize.saturating_sub(4);
         let truncated = if text.len() > max {
             format!("{}…", &text[..max.saturating_sub(1)])
@@ -187,10 +262,12 @@ impl Spinner {
             text.to_string()
         };
         if is_color_terminal() {
-            eprint!("  ⠋ {}       \r", truncated);
+            eprint!("  {} {}       \r", ch, truncated);
         } else {
             eprint!("  {}       \r", truncated);
         }
+        send_msg(text);
+        self.spin = (self.spin + 1) % SPINNER_CHARS.len();
     }
 
     pub fn finish(&self) {
@@ -198,6 +275,22 @@ impl Spinner {
             eprintln!("  {} {}        ", green("✔"), self.message);
         } else {
             eprintln!("  {}        ", self.message);
+        }
+        send_msg(format!("✔ {}", self.message));
+    }
+
+    fn print_frame(spin: usize, msg: &str) {
+        let ch = SPINNER_CHARS[spin % SPINNER_CHARS.len()] as char;
+        let max = 80usize.saturating_sub(4);
+        let truncated = if msg.len() > max {
+            format!("{}…", &msg[..max.saturating_sub(1)])
+        } else {
+            msg.to_string()
+        };
+        if is_color_terminal() {
+            eprint!("  {} {}       \r", ch, truncated);
+        } else {
+            eprint!("  {}       \r", truncated);
         }
     }
 }
@@ -293,6 +386,11 @@ impl ProgressBar {
             fmt_speed(speed),
             self.message,
         );
+        if current_uid().is_some() {
+            let pct = self.total.map(|t| if t > 0 { downloaded / t as f64 * 100.0 } else { 0.0 });
+            let pct_str = pct.map(|p| format!(" {:.0}%", p)).unwrap_or_default();
+            send_msg(format!("📥 {}{} ({} {})", self.message, pct_str, fmt_size(downloaded), fmt_speed(speed)));
+        }
         true
     }
 
@@ -307,6 +405,7 @@ impl ProgressBar {
             dim(fmt_size(self.downloaded as f64)),
             dim(fmt_duration(elapsed)),
         );
+        send_msg(format!("✔ {} {} [{}]", label, fmt_size(self.downloaded as f64), fmt_duration(elapsed)));
     }
 
     /// Mark complete when the download was resumed (partial).
@@ -322,6 +421,7 @@ impl ProgressBar {
             dim(format!("[+{}]", fmt_size(resumed_bytes as f64))),
             dim(fmt_duration(elapsed)),
         );
+        send_msg(format!("✔ {} {} [+{}] [{}]", label, fmt_size(self.downloaded as f64), fmt_size(resumed_bytes as f64), fmt_duration(elapsed)));
     }
 
     /// Mark as failed.
@@ -331,6 +431,7 @@ impl ProgressBar {
         eprintln!("\r  {} {} {}        ",
             red("✖"), self.message, msg,
         );
+        send_msg(format!("✖ {} {}", self.message, msg));
     }
 }
 

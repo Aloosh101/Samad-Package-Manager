@@ -28,14 +28,21 @@ pub(crate) fn run_with_progress(
     });
 
     let mut spinner = crate::output::Spinner::new(label);
+    let mut has_output = false;
     loop {
         match rx.try_recv() {
-            Ok(line) => spinner.message(&line),
+            Ok(line) => {
+                has_output = true;
+                spinner.message(&line);
+            }
             Err(mpsc::TryRecvError::Empty) => {
                 if child.try_wait()?.is_some() {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if !has_output {
+                    spinner.tick();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
         }

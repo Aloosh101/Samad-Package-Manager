@@ -50,6 +50,8 @@ pub struct SpmConfig {
     pub auto_snapshot: Option<bool>,
     pub prefer_newest: Option<bool>,
     pub auto_update_interval: Option<u64>,
+    /// Preferred repo source: "apt", "dnf", or "native"
+    pub preferred_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

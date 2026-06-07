@@ -2,6 +2,7 @@ pub mod backend;
 pub mod fs;
 pub mod hash;
 pub mod process;
+pub mod user;
 
 #[cfg(test)]
 mod tests {

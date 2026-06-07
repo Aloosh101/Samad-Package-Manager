@@ -92,13 +92,19 @@ pub fn send_snapshot_request(action: &str, id: Option<&str>) -> SpmResult<String
     send_request(&req)
 }
 
+pub fn send_dist_upgrade_request(yes: bool) -> SpmResult<String> {
+    send_action_request("dist-upgrade", Some(yes.to_string()))
+}
+
 fn send_request(req: &ClientRequest) -> SpmResult<String> {
     let socket_path = crate::daemon::socket_path();
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|e| SpmError::other(format!(
+    let mut stream = match try_connect(&socket_path) {
+        Ok(s) => s,
+        Err(e) => return Err(SpmError::other(format!(
             "Cannot connect to spmd at {socket_path}: {e}. Is spmd running?"
-        )))?;
+        ))),
+    };
 
     let json = serde_json::to_string(req)
         .map_err(|e| SpmError::other(format!("Serialization error: {e}")))?;
@@ -107,24 +113,67 @@ fn send_request(req: &ClientRequest) -> SpmResult<String> {
         .map_err(|e| SpmError::other(format!("Cannot send request: {e}")))?;
 
     let mut reader = BufReader::new(&stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)
-        .map_err(|e| SpmError::other(format!("Cannot read response: {e}")))?;
 
-    #[derive(serde::Deserialize)]
-    struct RpcResponse {
-        status: String,
-        message: String,
+    // Read streaming progress lines, then final result
+    loop {
+        let mut response = String::new();
+        reader.read_line(&mut response)
+            .map_err(|e| SpmError::other(format!("Cannot read response: {e}")))?;
+
+        if response.trim().is_empty() {
+            continue;
+        }
+
+        // Try to parse as progress line or result
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(response.trim()) {
+            if let Some(typ) = val.get("type").and_then(|v| v.as_str()) {
+                if typ == "progress" {
+                    if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
+                        eprintln!("  {}", msg);
+                    }
+                    continue;
+                }
+            }
+            if let Some(status) = val.get("status").and_then(|v| v.as_str()) {
+                let message = val.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                if status == "error" {
+                    return Err(SpmError::other(format!("Daemon error: {message}")));
+                }
+                return Ok(message.to_string());
+            }
+        }
+
+        // Fallback: print unrecognized lines
+        eprintln!("{}", response.trim());
     }
+}
 
-    let resp: RpcResponse = serde_json::from_str(response.trim())
-        .map_err(|e| SpmError::other(format!("Invalid response from daemon: {e}")))?;
-
-    if resp.status == "error" {
-        return Err(SpmError::other(format!("Daemon error: {}", resp.message)));
+fn try_connect(socket_path: &str) -> Result<UnixStream, std::io::Error> {
+    match UnixStream::connect(socket_path) {
+        Ok(s) => return Ok(s),
+        Err(_) => {}
     }
-
-    Ok(resp.message)
+    // Daemon not running — try to auto-start it
+    let status = std::process::Command::new("systemctl")
+        .args(["is-active", "spmd"])
+        .output();
+    let needs_start = match status {
+        Ok(out) => !out.status.success(),
+        Err(_) => true,
+    };
+    if needs_start {
+        for &(bin, args) in &[("pkexec", &["systemctl", "start", "spmd"] as &[_]),
+                               ("sudo", &["systemctl", "start", "spmd"] as &[_])] {
+            if let Ok(mut child) = std::process::Command::new(bin).args(args).spawn() {
+                if child.wait().ok().map(|s| s.success()).unwrap_or(false) { break; }
+            }
+        }
+        for _ in 0..20 {
+            if let Ok(s) = UnixStream::connect(socket_path) { return Ok(s); }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    UnixStream::connect(socket_path)
 }
 
 #[cfg(test)]

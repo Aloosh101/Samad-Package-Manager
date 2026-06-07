@@ -32,6 +32,7 @@ mod tests {
             auto_snapshot: Some(true),
             prefer_newest: None,
             auto_update_interval: None,
+            preferred_source: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let deserialized: SpmConfig = serde_json::from_str(&json).unwrap();

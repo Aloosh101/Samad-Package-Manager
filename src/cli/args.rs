@@ -10,7 +10,7 @@ use crate::types::SpmConfig;
 use crate::util::process;
 
 #[derive(Parser, Debug)]
-#[command(name = "spm", version = "0.1.3", about = "Samad Package Manager")]
+#[command(name = "spm", version = "0.2.0", about = "Samad Package Manager")]
 pub struct SpmArgs {
     #[command(subcommand)]
     pub command: SpmCommand,
@@ -492,71 +492,33 @@ impl SpmArgs {
                 convert_only,
                 replace,
                 yes,
-                smart,
+                smart: _,
                 prefer_newest,
                 stable_debian,
                 newest_redhat,
             } => {
-                let (strategy, preferred_source) = Self::resolve_mode(
-                    *prefer_newest, *stable_debian, *newest_redhat,
-                );
                 if let Some(path) = convert_only {
                     sam::convert_to_sam(path)?;
                     crate::output::result_message(format!("Converted {} to .sam format", path));
                 } else if sandbox.is_some() {
+                    let (strategy, _preferred_source) = Self::resolve_mode(
+                        *prefer_newest, *stable_debian, *newest_redhat,
+                    );
                     let sandbox_level = sandbox.as_ref().and_then(|s| s.as_deref()).unwrap_or("standard");
                     install::install_package(package, Some(sandbox_level), *replace, *yes, strategy)?;
                 } else if Self::is_local_path(package) {
                     install::install_local_package(package, *replace, *yes)?;
                 } else {
-                    if *smart {
-                        install::install_package_smart(package, None, *replace, *yes, true, strategy, preferred_source)?;
-                    } else {
-                        match client::send_install_request(package) {
-                            Ok(msg) => println!("{}", msg),
-                            Err(e) => {
-                                let msg = format!("{e}");
-                                if msg.starts_with("Cannot connect to spmd") {
-                                    crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                                    crate::output::step_info("Falling back to direct installation...");
-                                    install::install_package_smart(package, None, *replace, *yes, *smart, strategy, preferred_source)?;
-                                } else {
-                                    let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
-                                    return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
-                                }
-                            }
-                        }
-                    }
+                    let msg = client::send_install_request(package)?;
+                    println!("{}", msg);
                 }
                 Ok(())
             }
 
             SpmCommand::Repo { action } => match action {
-                RepoAction::Add { name, source, url, mirror, priority } => {
-                    let priority = Some(*priority);
-                    match client::send_repo_request("add", name, Some(source), url.as_deref(), mirror) {
-                        Ok(msg) => println!("{}", msg),
-                        Err(e) => {
-                            let msg = format!("{e}");
-                            if msg.starts_with("Cannot connect to spmd") {
-                                crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                            } else {
-                                crate::output::step_warn(format!("Daemon error: {msg}"));
-                            }
-                            crate::output::step_info("Falling back to direct repo add...");
-                            let source_enum = match source.as_str() {
-                                "apt" => crate::types::RepoSource::Apt,
-                                "dnf" => crate::types::RepoSource::Dnf,
-                                "native" => crate::types::RepoSource::Native,
-                                _ => return Err(crate::error::SpmError::config(
-                                    format!("Invalid repo source '{source}'. Use apt, dnf, or native")
-                                )),
-                            };
-                            let mirrors = if mirror.is_empty() { None } else { Some(mirror.clone()) };
-                            repos::add_repo(name, source_enum, url.clone(), mirrors, priority)?;
-                            crate::output::result_message(format!("Added repository '{name}' ({source})"));
-                        }
-                    }
+                RepoAction::Add { name, source, url, mirror, priority: _ } => {
+                    let msg = client::send_repo_request("add", name, Some(source), url.as_deref(), mirror)?;
+                    println!("{}", msg);
                     Ok(())
                 }
                 RepoAction::List => {
@@ -564,20 +526,8 @@ impl SpmArgs {
                     Ok(())
                 }
                 RepoAction::Remove { name } => {
-                    match client::send_repo_request("remove", name, None, None, &[]) {
-                        Ok(msg) => println!("{}", msg),
-                        Err(e) => {
-                            let msg = format!("{e}");
-                            if msg.starts_with("Cannot connect to spmd") {
-                                crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                            } else {
-                                crate::output::step_warn(format!("Daemon error: {msg}"));
-                            }
-                            crate::output::step_info("Falling back to direct repo remove...");
-                            repos::remove_repo(name)?;
-                            crate::output::result_message(format!("Removed repository '{name}'"));
-                        }
-                    }
+                    let msg = client::send_repo_request("remove", name, None, None, &[])?;
+                    println!("{}", msg);
                     Ok(())
                 }
                 RepoAction::Create { name, source, path, codename, component, mirror } => {
@@ -673,15 +623,9 @@ impl SpmArgs {
                 crate::output::result_message(format!("Built {}", output_path));
                 Ok(())
             }
-            SpmCommand::Cleanup { force } => {
-                match client::send_cleanup_request() {
-                    Ok(msg) => println!("{}", msg),
-                    Err(e) => {
-                        crate::output::step_warn(format!("Daemon unavailable: {e}"));
-                        crate::output::step_info("Falling back to direct cleanup...");
-                        crate::package::cleanup::cleanup_all(*force)?;
-                    }
-                }
+            SpmCommand::Cleanup { force: _ } => {
+                let msg = client::send_cleanup_request()?;
+                println!("{}", msg);
                 Ok(())
             }
 
@@ -699,58 +643,23 @@ impl SpmArgs {
             },
 
             SpmCommand::Remove { package, yes: _ } => {
-                match client::send_remove_by_name_request(package) {
-                    Ok(msg) => println!("{}", msg),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if msg.starts_with("Cannot connect to spmd") {
-                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                            crate::output::step_info("Falling back to direct removal...");
-                            install::remove_package(package)?;
-                        } else {
-                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
-                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
-                        }
-                    }
-                }
+                let msg = client::send_remove_by_name_request(package)?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::Purge { package } => {
-                match client::send_purge_request(package) {
-                    Ok(msg) => println!("{}", msg),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if msg.starts_with("Cannot connect to spmd") {
-                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                            crate::output::step_info("Falling back to direct purge...");
-                            install::purge_package(package)?;
-                        } else {
-                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
-                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
-                        }
-                    }
-                }
+                let msg = client::send_purge_request(package)?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::Autoremove { yes } => {
-                match client::send_autoremove_request(*yes) {
-                    Ok(msg) => println!("{}", msg),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if msg.starts_with("Cannot connect to spmd") {
-                            crate::output::step_warn(format!("Daemon unavailable: {msg}"));
-                            crate::output::step_info("Falling back to direct autoremove...");
-                            install::autoremove_packages(*yes)?;
-                        } else {
-                            let daemon_msg = msg.strip_prefix("Daemon error: ").unwrap_or(&msg);
-                            return Err(crate::error::SpmError::other(format!("{daemon_msg}")));
-                        }
-                    }
-                }
+                let msg = client::send_autoremove_request(*yes)?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::Update => {
-                repos::update_repos()?;
+                let msg = client::send_update_request()?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::Index { action } => match action {
@@ -760,15 +669,14 @@ impl SpmArgs {
                     Ok(())
                 }
             }
-            SpmCommand::Upgrade { package, prefer_newest, stable_debian, newest_redhat } => {
-                let (strategy, preferred_source) = Self::resolve_mode(
-                    *prefer_newest, *stable_debian, *newest_redhat,
-                );
-                install::upgrade_package(package.as_deref(), strategy, preferred_source)?;
+            SpmCommand::Upgrade { package, prefer_newest: _, stable_debian: _, newest_redhat: _ } => {
+                let msg = client::send_upgrade_request(package.clone())?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::DistUpgrade { yes } => {
-                install::dist_upgrade_packages(*yes)?;
+                let msg = client::send_dist_upgrade_request(*yes)?;
+                println!("{}", msg);
                 Ok(())
             }
             SpmCommand::Search { query } => {

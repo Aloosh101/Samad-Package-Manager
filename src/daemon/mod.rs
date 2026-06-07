@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -182,7 +182,7 @@ impl RateLimiter {
             Ok(r) => r,
             Err(e) => {
                 let resp = DaemonResponse::error(&format!("Invalid JSON: {e}"));
-                let mut w = stream;
+                let mut w = &stream;
                 let _ = w.write_all(resp.as_bytes());
                 return Err(SpmError::invalid_format(format!("Bad request: {e}")));
             }
@@ -190,7 +190,7 @@ impl RateLimiter {
 
         if req.user_id != uid {
             let resp = DaemonResponse::error("user_id mismatch: cannot impersonate another user");
-            let mut w = stream;
+            let mut w = &stream;
             let _ = w.write_all(resp.as_bytes());
             return Err(SpmError::permission_denied(format!(
                 "Peer UID {uid} attempted to impersonate UID {}", req.user_id
@@ -198,6 +198,22 @@ impl RateLimiter {
         }
 
         let action = req.action.clone();
+
+        // Set up progress streaming via channel
+        let (progress_tx, progress_rx) = mpsc::channel::<String>();
+        let writer = stream.try_clone()
+            .map_err(|e| SpmError::other(format!("Cannot clone socket: {e}")))?;
+        let relay = std::thread::spawn(move || {
+            while let Ok(msg) = progress_rx.recv() {
+                let line = format!("{{\"type\":\"progress\",\"message\":\"{}\"}}\n", msg);
+                let mut w = &writer;
+                let _ = w.write_all(line.as_bytes());
+                let _ = w.flush();
+            }
+        });
+
+        crate::output::set_progress_tx(uid, progress_tx.clone());
+        crate::output::set_current_uid(uid);
 
         let response = match action.as_str() {
             "install" => {
@@ -227,6 +243,13 @@ impl RateLimiter {
                     handle_update().await
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can update repositories"))
+                }
+            }
+            "dist-upgrade" => {
+                if authorized {
+                    handle_dist_upgrade(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can run dist-upgrade"))
                 }
             }
             "purge" => {
@@ -267,6 +290,12 @@ impl RateLimiter {
             other => Err(SpmError::other(format!("Unknown action: {other}"))),
         };
 
+        // Close the progress channel so the relay thread stops
+        drop(progress_tx);
+        crate::output::clear_progress_tx(uid);
+        crate::output::clear_current_uid();
+        let _ = relay.join();
+
         let (status, detail) = match response {
             Ok(msg) => ("ok", msg),
             Err(e) => ("error", e.to_string()),
@@ -278,7 +307,7 @@ impl RateLimiter {
             DaemonResponse::error(&detail)
         };
 
-        let mut w = stream;
+        let mut w = &stream;
         let _ = w.write_all(resp.as_bytes());
         if status == "ok" {
             tracing::info!("action={} uid={} ok", action, uid);
@@ -333,6 +362,7 @@ async fn handle_user_install(
         SpmError::other("Missing 'package' field".to_string())
     })?;
 
+    let user_name = crate::util::user::resolve_user_name(uid).unwrap_or_else(|| uid.to_string());
     let user_home = resolve_user_home(uid)?;
     let name = package.to_string();
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
@@ -341,7 +371,7 @@ async fn handle_user_install(
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("User install failed: {e}")))?;
 
-    Ok(format!("Installed {package} for user {uid}"))
+    Ok(format!("Installed {package} for {user_name}"))
 }
 
 async fn handle_user_remove(
@@ -352,6 +382,7 @@ async fn handle_user_remove(
         SpmError::other("Missing 'package' field".to_string())
     })?;
 
+    let user_name = crate::util::user::resolve_user_name(uid).unwrap_or_else(|| uid.to_string());
     let user_home = resolve_user_home(uid)?;
     let name = package.to_string();
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
@@ -360,7 +391,7 @@ async fn handle_user_remove(
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("User remove failed: {e}")))?;
 
-    Ok(format!("Removed {package} for user {uid}"))
+    Ok(format!("Removed {package} for {user_name}"))
 }
 
 async fn handle_list(
@@ -491,19 +522,7 @@ fn is_authorized(uid: u32) -> bool {
 }
 
 fn resolve_user_name(uid: u32) -> Option<String> {
-    // Read /etc/passwd line by line
-    let passwd = fs::read_to_string("/etc/passwd").ok()?;
-    for line in passwd.lines() {
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() >= 3 {
-            if let Ok(u) = parts[2].parse::<u32>() {
-                if u == uid {
-                    return Some(parts[0].to_string());
-                }
-            }
-        }
-    }
-    None
+    crate::util::user::resolve_user_name(uid)
 }
 
 async fn handle_update() -> Result<String, SpmError> {
@@ -513,6 +532,16 @@ async fn handle_update() -> Result<String, SpmError> {
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Update failed: {e}")))?;
     Ok("Repositories updated".to_string())
+}
+
+async fn handle_dist_upgrade(req: &DaemonRequest) -> Result<String, SpmError> {
+    let yes = req.package.as_deref().and_then(|v| v.parse::<bool>().ok()).unwrap_or(false);
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::package::install::dist_upgrade_packages(yes)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Dist-upgrade failed: {e}")))?;
+    Ok("Distribution upgrade completed".to_string())
 }
 
 async fn handle_purge(req: &DaemonRequest) -> Result<String, SpmError> {

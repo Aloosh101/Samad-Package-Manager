@@ -9,6 +9,10 @@ use crate::types::*;
 use super::{repo_has_package, source_to_format};
 
 pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<()> {
+    let user_name = crate::util::user::resolve_user_name(user_id).unwrap_or_else(|| user_id.to_string());
+    crate::output::section(format!("📦 Installing '{name}' for {user_name}"));
+    let mut spinner = crate::output::Spinner::new(format!("Looking up '{name}' in repositories..."));
+
     let repos_list = repos::load_repos()?;
 
     let (_target_format, repo_name, repo_config) = repos_list
@@ -22,12 +26,15 @@ pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<
             "Package '{name}' not found in any repository"
         )))?;
 
+    spinner.message(&format!("Found in repository '{repo_name}'"));
+
     let tmp_dir_obj = tempfile::tempdir()
         .map_err(|e| SpmError::other(format!("Failed to create temp directory: {e}")))?;
     let tmp_dir = tmp_dir_obj.path().to_string_lossy().to_string();
     let raw_dir = format!("{tmp_dir}/raw");
     fs::create_dir_all(&raw_dir)?;
 
+    spinner.message("Downloading and extracting...");
     let result = match repo_config.source {
         RepoSource::Apt => {
             crate::package::fetch::fetch_apt_to_temp(name, &repo_name, &repo_config, &raw_dir)
@@ -49,10 +56,12 @@ pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<
         }
     };
 
+    spinner.message("Verifying and registering...");
     let hash = crate::util::hash::hash_dir(Path::new(&fetched.extracted_dir))?;
 
     db::with_write_lock(|conn| {
         if db::is_installed_for_user(conn, user_id, name)? {
+            spinner.finish();
             return Err(SpmError::package_already_installed(format!(
                 "Package '{name}' is already installed for user {user_id}"
             )));
@@ -63,19 +72,22 @@ pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<
             &hash,
         )?;
 
+        spinner.message("Creating symlinks...");
         let symlinks = crate::cache::create_user_symlinks(&hash, user_home)?;
 
         if symlinks.is_empty() {
             if is_new {
                 let _ = fs::remove_dir_all(&pkg_dir);
             }
+            spinner.finish();
             return Err(SpmError::other(format!(
                 "No executable files found in package '{name}'"
             )));
         }
 
         db::record_user_install(conn, user_id, name, &source_to_format(&repo_config.source), &hash)?;
-        crate::output::step_success(format!("Installed '{}' for user {user_id} ({} symlinks)", name, symlinks.len()));
+        spinner.finish();
+        crate::output::step_success(format!("Installed '{}' for {} ({} symlinks)", name, user_name, symlinks.len()));
 
         Ok(())
     })?;
@@ -99,6 +111,9 @@ fn collect_symlink_targets(pkg_dir: &Path) -> Vec<String> {
 }
 
 pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<()> {
+    let user_name = crate::util::user::resolve_user_name(user_id).unwrap_or_else(|| user_id.to_string());
+    crate::output::section(format!("🗑 Removing '{name}' for {user_name}"));
+
     // Phase 1: Collect info and verify package exists (read lock)
     let (ui, hash, symlink_targets) = db::with_read_lock(|conn| {
         let installs = db::list_user_installs(conn, user_id)?;
@@ -117,6 +132,8 @@ pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<(
         Ok((ui, hash, symlink_targets))
     })?;
 
+    let mut spinner = crate::output::Spinner::new(format!("Removing symlinks for '{name}' ({})", symlink_targets.len()));
+
     // Phase 2: Physically remove symlinks
     let bin_dir = crate::cache::user_bin_dir(user_home);
     let mut remove_errors: Vec<String> = Vec::new();
@@ -125,6 +142,8 @@ pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<(
         if dest.exists() || dest.is_symlink() {
             if let Err(e) = fs::remove_file(&dest) {
                 remove_errors.push(format!("  {}: {e}", dest.display()));
+            } else {
+                spinner.message(&format!("Removed {target}"));
             }
         }
     }
@@ -134,6 +153,7 @@ pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<(
         db::count_users_for_package_hash(conn, &hash)
     })?;
     if remaining <= 1 {
+        spinner.message("Removing shared cache...");
         if let Err(e) = crate::cache::remove_shared_package(&hash) {
             remove_errors.push(format!("  shared package {hash}: {e}"));
         }
@@ -141,8 +161,9 @@ pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<(
 
     // Phase 4: Verify 100% physical removal before DB delete
     if !remove_errors.is_empty() {
+        spinner.finish();
         return Err(SpmError::other(format!(
-            "Failed to remove some symlinks for '{name}' (user {user_id}). DB was NOT modified:\n{}",
+            "Failed to remove some symlinks for '{name}' (user {user_name}). DB was NOT modified:\n{}",
             remove_errors.join("\n"),
         )));
     }
@@ -150,7 +171,8 @@ pub fn remove_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<(
     // Phase 5: Safe to update DB
     db::with_write_lock(|conn| {
         db::remove_user_install(conn, user_id, name, &ui.package_format)?;
-        crate::output::step_success(format!("Removed '{name}' for user {user_id}"));
+        spinner.finish();
+        crate::output::step_success(format!("Removed '{name}' for {user_name}"));
         Ok(())
     })
 }

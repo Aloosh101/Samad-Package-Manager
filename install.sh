@@ -4,9 +4,11 @@ set -euo pipefail
 # install.sh — Install SPM on any Linux system
 #
 # Usage:
-#   ./install.sh                    # interactive (asks root vs non-root)
-#   ./install.sh --root             # force root installation
-#   ./install.sh --user             # force non-root installation
+#   ./install.sh                    # interactive (asks root vs user, source, version)
+#   ./install.sh --root             # force root installation (interactive for source/version)
+#   ./install.sh --user             # force user installation (interactive for source/version)
+#   ./install.sh --root --source=apt --version=stable   # fully non-interactive
+#   ./install.sh --user --source=dnf --version=newest   # fully non-interactive
 #   ./install.sh --help             # show this help
 #
 # Root mode:
@@ -17,12 +19,18 @@ set -euo pipefail
 #   daemon   → systemd service (spmd)
 #   man pages → /usr/local/share/man/man8/
 #
-# Non-root mode:
-#   spm      → ~/.local/bin/spm
+# Non-root mode (user has sudo):
+#   spm      → ~/.local/bin/spm          (user binary)
+#   spmd     → /usr/local/bin/spmd       (daemon — requires sudo)
 #   backends → system PATH (no isolation)
-#   database → ~/.local/share/spm/
-#   no daemon (requires root for socket)
+#   daemon   → systemd service (installed via sudo)
+#   database → /var/lib/spm/ (system-wide)
 #   no man pages
+#
+# Interactive prompts:
+#   1. Installation scope (root / user)
+#   2. Preferred source  (apt / dnf / native)
+#   3. Version preference (stable / newest)
 #
 
 SPM_SRC="${SPM_SRC:-$(dirname "$0")/target/debug}"
@@ -65,6 +73,8 @@ detect_distro() {
 }
 
 install_root() {
+    local pref_source="$1"
+    local pref_version="$2"
     local distro
     distro=$(detect_distro)
 
@@ -102,11 +112,23 @@ install_root() {
     /usr/local/bin/spm init --fix-backend --from-system || warn "spm init --from-system failed (non-root? no system package manager?)"
     ok "Database initialized, system packages imported"
 
-    # 4. Daemon service
+    # 4. Apply user preferences
+    info "Setting preferences..."
+    if [ "$pref_source" = "apt" ]; then
+        /usr/local/bin/spm config set preferred_source apt 2>/dev/null || true
+    elif [ "$pref_source" = "dnf" ]; then
+        /usr/local/bin/spm config set preferred_source dnf 2>/dev/null || true
+    fi
+    if [ "$pref_version" = "newest" ]; then
+        /usr/local/bin/spm config set prefer_newest true 2>/dev/null || true
+    fi
+    ok "Preferences saved"
+
+    # 5. Daemon service
     info "Running: spm init --install-daemon"
     /usr/local/bin/spm init --install-daemon || warn "spm init --install-daemon failed (no systemd?)"
 
-    # 5. Man pages
+    # 6. Man pages
     local mandir="/usr/local/share/man/man8"
     if [ -d "$(dirname "$0")/docs/man" ]; then
         mkdir -p "$mandir"
@@ -120,21 +142,23 @@ install_root() {
     echo "  spm  → /usr/local/bin/spm"
     echo "  spmd → /usr/local/bin/spmd"
     echo "  man  → $mandir"
+    echo "  source → $pref_source, version → $pref_version"
     spm --version
 }
 
 install_user() {
+    local pref_source="$1"
+    local pref_version="$2"
     local bindir="${HOME}/.local/bin"
-    local sharedir="${HOME}/.local/share/spm"
 
-    header "User installation — ~/.local"
+    header "User installation — ~/.local (daemon requires sudo)"
 
-    mkdir -p "$bindir" "$sharedir"
+    mkdir -p "$bindir"
 
     info "Copying spm → $bindir/spm"
     cp -f "$SPM_BIN" "$bindir/spm"
     chmod 755 "$bindir/spm"
-    ok "Binary installed"
+    ok "spm installed"
 
     # Ensure ~/.local/bin is in PATH
     case ":$PATH:" in
@@ -145,20 +169,39 @@ install_user() {
 
     # Backends — not isolated, use system PATH
     warn "Non-root: backends stay on system PATH (not isolated)"
-    warn "Non-root: daemon not available (needs root for ${CYAN}/run/spm.sock${NC})"
 
-    # Init with SPM_ROOT
-    info "Running: SPM_ROOT=$sharedir $bindir/spm init"
-    SPM_ROOT="$sharedir" "$bindir/spm" init || warn "spm init failed"
-    ok "SPM root at $sharedir"
+    # Daemon is required — install system-wide via sudo
+    if command -v sudo &>/dev/null; then
+        info "Installing spmd daemon (requires sudo)..."
+        sudo cp -f "$SPMD_BIN" /usr/local/bin/spmd
+        sudo chmod 755 /usr/local/bin/spmd
+        sudo /usr/local/bin/spm init --fix-backend --from-system 2>/dev/null || \
+            warn "spm init --from-system failed"
+        sudo /usr/local/bin/spm init --install-daemon 2>/dev/null || \
+            warn "Daemon installation failed (no systemd?). spm requires spmd running."
+        # Apply preferences via sudo (config goes to user's home)
+        if [ "$pref_source" = "apt" ]; then
+            /usr/local/bin/spm config set preferred_source apt 2>/dev/null || true
+        elif [ "$pref_source" = "dnf" ]; then
+            /usr/local/bin/spm config set preferred_source dnf 2>/dev/null || true
+        fi
+        if [ "$pref_version" = "newest" ]; then
+            /usr/local/bin/spm config set prefer_newest true 2>/dev/null || true
+        fi
+        ok "Preferences saved"
+    else
+        warn "sudo not available — cannot install daemon."
+        warn "spm requires spmd. Install it manually:"
+        warn "  # cp spmd /usr/local/bin/spmd && spmd &"
+        exit 1
+    fi
 
     header "SPM installed for current user"
     echo "  spm     → $bindir/spm"
-    echo "  root    → $sharedir"
-    echo "  daemon  → not available (root required)"
+    echo "  daemon  → /usr/local/bin/spmd (systemd service)"
+    echo "  source  → $pref_source, version → $pref_version"
     echo ""
     echo "Usage:  spm install <package>"
-    echo "        SPM_ROOT=$sharedir spm install <package>"
 }
 
 # ── Backend install helpers (duplicated from install-backends.sh for self-containment) ──
@@ -214,12 +257,16 @@ install_deb_backends() {
 
 main() {
     local mode=""
+    local pref_source=""
+    local pref_version=""
 
     for arg in "$@"; do
         case "$arg" in
             --help|-h) usage ;;
             --root)    mode="root" ;;
             --user)    mode="user" ;;
+            --source=*) pref_source="${arg#*=}" ;;
+            --version=*) pref_version="${arg#*=}" ;;
         esac
     done
 
@@ -231,8 +278,11 @@ main() {
         echo "${BOLD}SPM Installer${NC}"
         echo "This will install SPM (Samad Package Manager) on your system."
         echo ""
-        echo "${BOLD}1) Root installation${NC}  — system-wide  (spm, spmd, daemon, man pages)"
-        echo "${BOLD}2) User installation${NC}  — ~/.local     (spm only, no daemon)"
+
+        # ── Installation scope ──
+        echo "${BOLD}Installation scope:${NC}"
+        echo "  1) System-wide  — spm + spmd + daemon + man pages (requires root)"
+        echo "  2) User install  — spm → ~/.local/bin, daemon system-wide (requires sudo)"
         echo ""
         read -r -p "Choose [1/2] (default: 1): " choice
         case "$choice" in
@@ -240,6 +290,33 @@ main() {
             *)      mode="root" ;;
         esac
     fi
+
+    # ── Distro preference ──
+    echo ""
+    echo "${BOLD}Preferred package source:${NC}"
+    echo "  SPM supports both Debian/APT and RedHat/DNF packages."
+    echo "  If the preferred source fails, it auto-falls back to the other."
+    echo ""
+    echo "  1) Debian/APT — stable, wide selection (default)"
+    echo "  2) RedHat/DNF — newer packages, RPM ecosystem"
+    echo ""
+    read -r -p "Choose [1/2] (default: 1): " src_choice
+    case "$src_choice" in
+        2|dnf) pref_source="dnf" ;;
+        *)     pref_source="apt" ;;
+    esac
+
+    # ── Version preference ──
+    echo ""
+    echo "${BOLD}Version preference:${NC}"
+    echo "  1) Stable   — prefer well-tested releases (default)"
+    echo "  2) Newest   — bleeding edge, latest versions"
+    echo ""
+    read -r -p "Choose [1/2] (default: 1): " ver_choice
+    case "$ver_choice" in
+        2|newest) pref_version="newest" ;;
+        *)        pref_version="stable" ;;
+    esac
 
     case "$mode" in
         root)
@@ -250,10 +327,10 @@ main() {
                 echo "Or choose user installation instead."
                 exit 1
             fi
-            install_root
+            install_root "$pref_source" "$pref_version"
             ;;
         user)
-            install_user
+            install_user "$pref_source" "$pref_version"
             ;;
     esac
 }

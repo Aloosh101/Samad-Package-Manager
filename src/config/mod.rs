@@ -23,6 +23,7 @@ fn merge_config(system: SpmConfig, user: SpmConfig) -> SpmConfig {
         auto_snapshot: user.auto_snapshot.or(system.auto_snapshot),
         prefer_newest: user.prefer_newest.or(system.prefer_newest),
         auto_update_interval: user.auto_update_interval.or(system.auto_update_interval),
+        preferred_source: user.preferred_source.or(system.preferred_source),
     }
 }
 
@@ -62,8 +63,17 @@ impl SpmConfig {
                     SpmError::config(format!("auto_update_interval must be a number (seconds), got: {}", value))
                 })?);
             }
+            "preferred_source" => {
+                let valid = ["apt", "dnf", "native"];
+                if !valid.contains(&value) {
+                    return Err(SpmError::config(format!(
+                        "preferred_source must be one of: {}, got: {}", valid.join(", "), value
+                    )));
+                }
+                config.preferred_source = Some(value.to_string());
+            }
             _ => return Err(SpmError::config(format!(
-                "Unknown config key: {key}. Valid keys: db_path, cache_path, sandbox_path, log_level, auto_snapshot, prefer_newest, auto_update_interval"
+                "Unknown config key: {key}. Valid keys: db_path, cache_path, sandbox_path, log_level, auto_snapshot, prefer_newest, auto_update_interval, preferred_source"
             ))),
         }
 
@@ -147,11 +157,13 @@ auto_snapshot = true
             auto_snapshot: Some(false),
             prefer_newest: Some(true),
             auto_update_interval: None,
+            preferred_source: Some("apt".into()),
         };
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: SpmConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.db_path, Some("/a".into()));
         assert_eq!(parsed.auto_snapshot, Some(false));
+        assert_eq!(parsed.preferred_source, Some("apt".into()));
     }
 
     #[test]
@@ -173,6 +185,7 @@ auto_snapshot = true
             auto_snapshot: Some(false),
             prefer_newest: None,
             auto_update_interval: None,
+            preferred_source: Some("dnf".into()),
         };
         let user = SpmConfig {
             db_path: None,
@@ -182,6 +195,7 @@ auto_snapshot = true
             auto_snapshot: Some(true),
             prefer_newest: Some(true),
             auto_update_interval: Some(3600),
+            preferred_source: None,
         };
         let merged = merge_config(system, user);
         assert_eq!(merged.db_path, Some("/sys/db".into()));       // system kept
@@ -190,5 +204,6 @@ auto_snapshot = true
         assert_eq!(merged.log_level, Some("debug".into()));        // system kept
         assert_eq!(merged.auto_snapshot, Some(true));              // user overrides
         assert_eq!(merged.prefer_newest, Some(true));              // user sets
+        assert_eq!(merged.preferred_source, Some("dnf".into()));    // system kept (user didn't set)
     }
 }
