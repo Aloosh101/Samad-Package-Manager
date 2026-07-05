@@ -1,0 +1,2569 @@
+
+
+## 📋 **خطة التنفيذ النهائية - SPM (Samad Package Manager)**
+
+> **ملف مرجعي للتنفيذ الكامل** - تم إنشاؤه بناءً على تحليل 60+ ملف ومتطلباتك المحددة
+
+---
+
+### **🎯 الرؤية المعمارية المحدثة**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        SPMD (Daemon - الدماغ)                    │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌───────────┐  │
+│  │ Permission  │ │  Conflict   │ │  Transaction│ │  Store    │  │
+│  │   Engine    │ │  Detector   │ │   Manager   │ │  Manager  │  │
+│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └─────┬─────┘  │
+│         │               │               │               │        │
+│         ▼               ▼               ▼               ▼        │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              CONTENT-ADDRESSED STORE (BLAKE3)            │    │
+│  │  /var/lib/spm/store/{deb,rpm,sam,shared}/shard/hash/    │    │
+│  │  ├── deb/ab/abc123.../usr/lib/libssl.so.3  ← hardlink   │    │
+│  │  ├── rpm/cd/cdef45.../usr/lib/libssl.so.3  ← hardlink   │    │
+│  │  ├── sam/ef/ef5678.../usr/lib/libssl.so.3  ← hardlink   │    │
+│  │  └── shared/libs/libssl.so.3 → single physical copy     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+        ┌──────────┐   ┌──────────┐   ┌──────────┐
+        │  SPM CLI │   │ SPM CLI  │   │ SPM CLI  │
+        │ (user)   │   │ (root)   │   │ (remote) │
+        └──────────┘   └──────────┘   └──────────┘
+```
+
+---
+
+### **📦 المرحلة 0: البنية التحتية والتبعيات (أسبوع 0)**
+
+#### **0.1 تحديث `Cargo.toml` - المكتبات النقية (Pure Rust)**
+
+```toml
+# إزالة: ureq, dpkg-deb, rpm2cpio, cpio, apt-get, dnf من PATH
+# إضافة: مكتبات Rust نقية
+
+[dependencies]
+# HTTP & Download
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream", "gzip", "brotli", "zstd"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs", "io-util", "sync", "macros", "time", "process"] }
+
+# Debian Package Parsing
+deb822 = "0.3"           # تحليل Packages.gz, control files
+ar = "0.3"               # قراءة ar archives
+async-ar = "0.2"         # async ar extraction
+tar = "0.4"
+xz2 = "0.1"              # xz decompression
+flate2 = "1.0"           # gzip decompression
+zstd = "0.13"            # zstd (مستعمل بالفعل)
+
+# RPM Package Parsing
+rpm-rs = "0.2"           # RPM header parsing, payload extraction
+cpio = "0.2"             # cpio extraction
+
+# XML Parsing (RPM repomd.xml, primary.xml.gz)
+quick-xml = { version = "0.31", features = ["serialize", "async"] }
+
+# Crypto & Signatures
+sequoia-openpgp = "1.20" # OpenPGP signature verification
+ed25519-dalek = { version = "2", features = ["signature", "pkcs8", "pem", "fast"] } # موجود
+blake3 = "1.8"           # موجود
+sha2 = "0.10"            # موجود
+
+# System & Isolation
+nix = { version = "0.29", features = ["user", "fs", "process", "sched"] } # موجود + sched
+libc = "0.2"             # موجود
+caps = "0.4"             # capability manipulation
+seccomp = "0.4"          # seccomp-bpf filters
+landlock = "0.5"         # Linux Landlock LSM (للعزل الإضافي)
+
+# File Monitoring
+notify = { version = "6", features = ["inotify"] }  # inotify для detection
+fd-lock = "4.0"          # موجود
+
+# UX & Terminal
+indicatif = "0.17"       # Progress bars, spinners
+clap_complete = "4.6"    # Shell completions
+colored = "2"            # ألوان
+console = "0.15"         # Terminal features
+dialoguer = "0.11"       # Interactive prompts محسنة
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] } # موجود
+serde_json = "1.0"       # موجود
+toml = "0.8"             # موجود
+
+# Database
+rusqlite = { version = "0.40", features = ["bundled"] } # موجود
+
+# Dependency Resolution
+pubgrub = "0.4"          # موجود
+
+# Async utilities
+futures = "0.3"
+bytes = "1.5"
+```
+
+#### **0.2 هيكلية الموديلات الجديدة**
+
+```
+src/
+├── lib.rs                    # Re-exports
+├── main.rs                   # Entry point (spm CLI)
+├── daemon/
+│   ├── mod.rs                # spmd main loop
+│   ├── permission.rs         # Permission Engine (جديد)
+│   ├── conflict.rs           # Conflict Detector (جديد)
+│   ├── transaction.rs        # Transaction Manager (محدث)
+│   ├── store.rs              # Store Manager (محدث)
+│   ├── monitor.rs            # File System Monitor (جديد - inotify)
+│   └── ipc.rs                # Client-Daemon Protocol (محدث)
+├── store/
+│   ├── mod.rs                # Content-Addressed Store
+│   ├── deduplication.rs      # SONAME Deduplication (جديد)
+│   ├── hardlink.rs           # Hardlink management (جديد)
+│   └── gc.rs                 # Garbage Collection
+├── package/
+│   ├── fetch/
+│   │   ├── mod.rs
+│   │   ├── debian.rs         # Pure Rust Debian fetcher (جديد)
+│   │   ├── rpm.rs            # Pure Rust RPM fetcher (جديد)
+│   │   ├── native.rs         # SAM fetcher
+│   │   ├── download.rs       # Resumable download (محدث)
+│   │   └── verify.rs         # Signature + Hash verification (جديد)
+│   ├── extract/
+│   │   ├── mod.rs
+│   │   ├── deb.rs            # ar + tar.xz (جديد)
+│   │   ├── rpm.rs            # rpm-rs + cpio (جديد)
+│   │   └── sam.rs            # SAM extraction
+│   ├── index/
+│   │   ├── mod.rs
+│   │   ├── debian.rs         # deb822 parsing (محدث)
+│   │   ├── rpm.rs            # quick-xml parsing (محدث)
+│   │   └── native.rs
+│   ├── resolver/
+│   │   ├── mod.rs            # Dependency Resolver (إعادة كتابة كاملة)
+│   │   ├── pubgrub.rs        # PubGrub integration
+│   │   ├── graph.rs          # ResolvedGraph with cycles, conflicts
+│   │   └── cache.rs          # Dependency Cache with TTL/epoch
+│   ├── sandbox/
+│   │   ├── mod.rs
+│   │   ├── namespaces.rs     # PID, Mount, Network, UTS, User (محدث)
+│   │   ├── seccomp.rs        # seccomp-bpf profiles (جديد)
+│   │   ├── landlock.rs       # Landlock rules (جديد)
+│   │   ├── cgroups.rs        # cgroup v2 limits (جديد)
+│   │   └── launcher.rs       # Sandbox process launcher
+│   ├── install/
+│   │   ├── mod.rs
+│   │   ├── planner.rs        # Installation Planner
+│   │   ├── executor.rs       # Transaction Executor
+│   │   ├── conflict.rs       # Conflict Resolution UI (جديد - Zypper-like)
+│   │   └── hooks.rs          # System integration hooks
+│   └── build.rs              # SAM building
+├── isolation/
+│   ├── mod.rs                # Coexistence Detection (جديد)
+│   ├── detector.rs           # inotify-based detection
+│   ├── freezer.rs            # Process freezing (SIGSTOP/SIGCONT)
+│   └── mediator.rs           # User mediation UI
+├── ux/
+│   ├── mod.rs
+│   ├── progress.rs           # indicatif-based progress
+│   ├── prompts.rs            # dialoguer-based prompts
+│   ├── formatter.rs          # Output formatting
+│   └── completions.rs        # Shell completions
+├── kernel/                   # موجود (GPU, kernel hooks)
+├── config/                   # موجود
+├── db/                       # موجود
+├── types/                    # موجود (مع إضافات)
+├── util/                     # موجود
+├── error.rs                  # موجود
+└── output.rs                 # يدمج في ux/
+```
+
+---
+
+### **🧠 المرحلة 1: Substore Engine - المحرك الأساسي (أسبوع 1-2)**
+
+#### **1.1 Content-Addressed Store مع Deduplication**
+
+```rust
+// src/store/deduplication.rs
+
+pub struct StoreManager {
+    base: PathBuf,
+    origins: HashMap<PackageFormat, OriginStore>,
+    shared_libs: SharedLibStore,
+}
+
+pub struct OriginStore {
+    format: PackageFormat,
+    path: PathBuf,  // /var/lib/spm/store/deb/, /rpm/, /sam/
+}
+
+pub struct SharedLibStore {
+    path: PathBuf,  // /var/lib/spmkt /var/lib/spm/store/shared/libs/
+    soname_index: BTreeMap<String, SharedLibEntry>,
+}
+
+#[derive(Clone)]
+pub struct SharedLibEntry {
+    pub soname: String,           // libssl.so.3
+    pub hash: String,             // BLAKE3 hash
+    pub providers: Vec<Provider>, // من أي حزم جاء
+    pub ref_count: AtomicUsize,   // كم حزمة تستخدمه
+}
+
+#[derive(Clone)]
+pub struct Provider {
+    pub origin: PackageFormat,    // Deb, Rpm, Sam
+    pub package_name: String,     // libssl3, openssl-libs
+    pub package_hash: String,     // hash الحزمة الأصلية
+    pub priority: u32,            // أولوية المزود
+}
+
+// Logic:
+// 1. عند استخراج حزمة، فحص كل ملف .so
+// 2. حساب BLAKE3 hash للملف
+// 3. إذا موجود في shared_libs + hash مطابق → hardlink فقط
+// 4. إذا غير موجود → نسخ لـ shared_libs + hardlink لـ origin store
+// 5. تحديث soname_index مع المزود الجديد
+// 6. RPATH للـ binaries يشير لـ $ORIGIN/../shared/libs أو المسار المطلق
+```
+
+#### **1.2 Hardlink Strategy**
+
+```rust
+// src/store/hardlink.rs
+
+pub fn deduplicate_library(
+    store: &StoreManager,
+    origin_format: PackageFormat,
+    origin_hash: &str,
+    lib_path: &Path,          // مسار المكتبة في origin store
+    soname: &str,             // libssl.so.3
+) -> Result<()> {
+    let hash = blake3::hash_file(lib_path)?;
+
+    // فحص في shared libs
+    if let Some(entry) = store.shared_libs.get_by_hash(&hash) {
+        // Hash مطابق - hardlink
+        let shared_path = store.shared_libs.path_for(&entry.soname, &hash);
+        hardlink_or_copy(lib_path, &shared_path)?;
+
+        // تحديث index
+        entry.add_provider(Provider {
+            origin: origin_format,
+            package_name: extract_pkg_name(origin_hash),
+            package_hash: origin_hash.to_string(),
+            priority: get_priority(origin_format),
+        });
+        entry.ref_count.fetch_add(1, Ordering::Relaxed);
+
+        // استبدال الملف في origin store بـ hardlink لـ shared
+        fs::remove_file(lib_path)?;
+        fs::hard_link(&shared_path, lib_path)?;
+        return Ok(());
+    }
+
+    // جديد - نسخ لـ shared
+    let shared_path = store.shared_libs.path_for(soname, &hash);
+    fs::create_dir_all(shared_path.parent().unwrap())?;
+    fs::copy(lib_path, &shared_path)?;
+
+    // Hardlink من origin لـ shared
+    fs::remove_file(lib_path)?;
+    fs::hard_link(&shared_path, lib_path)?;
+
+    // إضافة لـ index
+    store.shared_libs.insert(SharedLibEntry {
+        soname: soname.to_string(),
+        hash,
+        providers: vec![Provider { ... }],
+        ref_count: AtomicUsize::new(1),
+    });
+
+    Ok(())
+}
+```
+
+---
+
+### **📥 المرحلة 2: Pure Rust Fetching & Extraction (أسبوع 2-3)**
+
+#### **2.1 Debian Fetcher (Pure Rust)**
+
+```rust
+// src/package/fetch/debian.rs
+
+pub struct DebianFetcher {
+    client: reqwest::Client,
+    mirrors: Vec<String>,
+    codename: String,
+    components: Vec<String>,
+    arch: String,
+}
+
+impl DebianFetcher {
+    pub async fn fetch_packages_index(&self) -> Result<PackagesIndex> {
+        // تحميل Packages.gz من المرايا مع resumable download
+        for mirror in &self.mirrors {
+            let url = format!("{}/dists/{}/{}/binary-{}/Packages.gz",
+                mirror, self.codename, component, self.arch);
+            if let Ok(data) = self.download_resumable(&url).await {
+                return parse_deb822_packages(&data);
+            }
+        }
+        Err(Error::NoMirrorAvailable)
+    }
+
+    pub async fn download_package(&self, pkg: &PackageInfo) -> Result<Vec<u8>> {
+        let url = format!("{}/{}", self.best_mirror(), pkg.filename);
+        self.download_resumable_with_progress(&url, pkg.size).await
+    }
+
+    async fn download_resumable(&self, url: &str) -> Result<Vec<u8>> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_path(url))?;
+
+        let downloaded = file.metadata()?.len();
+        let mut req = self.client.get(url);
+
+        if downloaded > 0 {
+            req = req.header("Range", format!("bytes={}-", downloaded));
+        }
+
+        let mut resp = req.send().await?;
+        let total = resp.content_length().unwrap_or(0) + downloaded;
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            buf.extend_from_slice(&chunk);
+            // تحديث progress bar
+        }
+
+        Ok(buf)
+    }
+}
+
+fn parse_deb822_packages(gz_data: &[u8]) -> Result<PackagesIndex> {
+    let mut decoder = flate2::read::GzDecoder::new(gz_data);
+    let mut content = String::new();
+    decoder.read_to_string(&mut content)?;
+
+    // استخدام deb822 crate للتحليل
+    let mut packages = Vec::new();
+    for paragraph in deb822::parse(&content) {
+        let pkg = PackageInfo {
+            name: paragraph.get("Package").unwrap().to_string(),
+            version: paragraph.get("Version").unwrap().to_string(),
+            architecture: paragraph.get("Architecture").unwrap().to_string(),
+            filename: paragraph.get("Filename").unwrap().to_string(),
+            size: paragraph.get("Size").unwrap().parse()?,
+            sha256: paragraph.get("SHA256").and_then(parse_sha256),
+            depends: parse_depends(paragraph.get("Depends")),
+            provides: parse_provides(paragraph.get("Provides")),
+        };
+        packages.push(pkg);
+    }
+    Ok(PackagesIndex { packages })
+}
+```
+
+#### **2.2 RPM Fetcher (Pure Rust)**
+
+```rust
+// src/package/fetch/rpm.rs
+
+pub struct RpmFetcher {
+    client: reqwest::Client,
+    baseurl: String,
+    repo_name: String,
+}
+
+impl RpmFetcher {
+    pub async fn fetch_repomd(&self) -> Result<RepoMd> {
+        let url = format!("{}/repodata/repomd.xml", self.baseurl);
+        let xml = self.download_resumable(&url).await?;
+        parse_repomd(&xml)
+    }
+
+    pub async fn fetch_primary_xml(&self, repomd: &RepoMd) -> Result<PrimaryXml> {
+        let location = repomd.find_location("primary")?;
+        let url = format!("{}/{}", self.baseurl, location);
+        let gz_data = self.download_resumable(&url).await?;
+
+        let mut decoder = flate2::read::GzDecoder::new(&gz_data);
+        let mut xml = String::new();
+        decoder.read_to_string(&mut xml)?;
+
+        parse_primary_xml(&xml)
+    }
+
+    pub async fn download_rpm(&self, pkg: &RpmPackageInfo) -> Result<Vec<u8>> {
+        let url = format!("{}/{}", self.baseurl, pkg.location_href);
+        self.download_resumable_with_progress(&url, pkg.size).await
+    }
+}
+
+fn parse_repomd(xml: &[u8]) -> Result<RepoMd> {
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    let mut repomd = RepoMd::default();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) if e.name().as_ref() == b"data" => {
+                let mut data = RepoData::default();
+                for attr in e.attributes() {
+                    let attr = attr?;
+                    match attr.key.as_ref() {
+                        b"type" => data.data_type = String::from_utf8_lossy(&attr.value).into_owned(),
+                        _ => {}
+                    }
+                }
+                // قراءة الأطفال: location, checksum, open-checksum, size
+                // ...
+                repomd.data.push(data);
+            }
+            Event::End(e) if e.name().as_ref() == b"repomd" => break,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(repomd)
+}
+```
+
+#### **2.3 Extractor Implementations**
+
+```rust
+// src/package/extract/deb.rs
+
+pub async fn extract_deb(deb_data: &[u8], dest: &Path) -> Result<()> {
+    // 1. قراءة ar archive
+    let mut ar = async_ar::Archive::new(Cursor::new(deb_data));
+
+    // 2. استخراج control.tar.xz و data.tar.xz
+    while let Some(entry) = ar.next_entry().await? {
+        let name = entry.header().name()?;
+        if name == "control.tar.xz" {
+            let mut control_data = Vec::new();
+            entry.read_to_end(&mut control_data).await?;
+            extract_tar_xz(&control_data, dest.join("CONTROL"))?;
+        } else if name == "data.tar.xz" {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).await?;
+            extract_tar_xz(&data, dest)?;  // استخراج مباشرة للـ dest
+        }
+    }
+    Ok(())
+}
+
+fn extract_tar_xz(data: &[u8], dest: &Path) -> Result<()> {
+    let mut decoder = xz2::read::XzDecoder::new(data);
+    let mut archive = tar::Archive::new(&mut decoder);
+    archive.unpack(dest)?;
+    Ok(())
+}
+
+// src/package/extract/rpm.rs
+
+pub async fn extract_rpm(rpm_data: &[u8], dest: &Path) -> Result<()> {
+    let mut cursor = Cursor::new(rpm_data);
+
+    // 1. استخدام rpm-rs لقراءة header
+    let package = rpm::Package::from_reader(&mut cursor)?;
+
+    // 2. استخراج payload (cpio.gz أو cpio.xz أو cpio.zstd)
+    let payload = package.payload()?;
+    let mut decoder = match payload.compression() {
+        Compression::Gzip => Box::new(flate2::read::GzDecoder::new(payload.data())) as Box<dyn Read>,
+        Compression::Xz => Box::new(xz2::read::XzDecoder::new(payload.data())),
+        Compression::Zstd => Box::new(zstd::Decoder::new(payload.data())?),
+        Compression::None => Box::new(payload.data()),
+    };
+
+    // 3. استخراج cpio
+    let mut cpio = cpio::Reader::new(&mut decoder);
+    for entry in cpio.entries() {
+        let entry = entry?;
+        let path = dest.join(entry.name()?);
+        if entry.is_dir() {
+            fs::create_dir_all(&path)?;
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::File::create(&path)?;
+            std::io::copy(&mut entry, &mut file)?;
+        }
+    }
+    Ok(())
+}
+```
+
+#### **2.4 Signature & Hash Verification**
+
+```rust
+// src/package/fetch/verify.rs
+
+pub struct Verifier {
+    trusted_keys: KeyStore,  // sequoia-openpgp CertStore
+}
+
+impl Verifier {
+    pub fn verify_debian(&self, pkg_data: &[u8], control: &ControlFile) -> Result<()> {
+        // 1. التحقق من SHA256 من Packages.gz
+        let expected_sha256 = control.sha256.as_ref()
+            .ok_or(Error::MissingHash)?;
+        let actual = sha256_hash(pkg_data);
+        if actual != *expected_sha256 {
+            return Err(Error::HashMismatch);
+        }
+
+        // 2. التحقق من التوقيع (InRelease/Release.gpg)
+        if let Some(sig_data) = self.fetch_signature(&control.origin).await? {
+            self.verify_openpgp_signature(&sig_data, pkg_data)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_rpm(&self, rpm: &rpm::Package) -> Result<()> {
+        // RPM signatures في header
+        if let Some(sig) = rpm.signature() {
+            // التحقق من RSA/DSA signature باستخدام المفاتيح الموثوقة
+            self.verify_rpm_signature(sig, rpm.payload_hash())?;
+        }
+        Ok(())
+    }
+
+    pub fn verify_sam(&self, sam: &SamPackage) -> Result<()> {
+        // Ed25519 signature في manifest
+        if let Some(sig) = &sam.manifest.signature {
+            let pubkey = self.trusted_keys.get_ed25519(&sig.key_id)?;
+            pubkey.verify(&sam.manifest_bytes, &sig.signature)?;
+        }
+        // BLAKE3 hash للـ data tar
+        let actual = blake3::hash(&sam.data_tar);
+        if actual != sam.manifest.data_hash {
+            return Err(Error::HashMismatch);
+        }
+        Ok(())
+    }
+}
+```
+
+---
+
+### **🔍 المرحلة 3: Dependency Resolver - إعادة كتابة كاملة (أسبوع 3)**
+
+#### **3.1 ResolvedGraph كامل**
+
+```rust
+// src/package/resolver/graph.rs
+
+#[derive(Debug, Clone)]
+pub struct ResolvedGraph {
+    pub topological_order: Vec<PackageId>,      // ترتيب التثبيت (dependencies أولاً)
+    pub cycles: Vec<Vec<PackageId>>,            // دورات مكتشفة
+    pub unresolved: Vec<UnresolvedDep>,         // تبعيات لم تُحل
+    pub metadata_conflicts: Vec<MetadataConflict>, // تعارضات metadata
+    pub alternatives: HashMap<String, Vec<Alternative>>, // بدائل OR dependencies
+}
+
+#[derive(Debug, Clone)]
+pub struct UnresolvedDep {
+    pub package: PackageId,
+    pub required_by: Vec<PackageId>,
+    pub reason: UnresolvedReason,
+}
+
+#[derive(Debug, Clone)]
+pub enum UnresolvedReason {
+    NotInRepos,
+    VersionConflict { required: String, available: String },
+    CircularDependency,
+    MissingProvider(String),  // SONAME لا يوجد له مزود
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataConflict {
+    pub package: String,
+    pub conflicts_with: String,
+    pub conflict_type: ConflictType,
+    pub severity: Severity,
+    pub suggestion: ConflictSuggestion,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConflictSuggestion {
+    RemoveConflicting,
+    SandboxInstall,
+    ForceReplace,
+    ManualResolution,
+}
+
+#[derive(Debug, Clone)]
+pub struct Alternative {
+    pub name: String,
+    pub format: PackageFormat,
+    pub version: String,
+    pub source: RepoSource,
+    pub priority: u32,
+}
+```
+
+#### **3.2 Resolver Implementation**
+
+```rust
+// src/package/resolver/mod.rs
+
+pub struct Resolver {
+    index: SonameIndex,
+    repos: Vec<RepoConfig>,
+    cache: DependencyCache,
+    config: ResolverConfig,
+}
+
+impl Resolver {
+    pub async fn resolve(&self, request: ResolveRequest) -> Result<ResolvedGraph> {
+        // Phase 1: جمع الحزم المطلوبة + تتبع OR dependencies
+        let mut worklist = vec![request.root];
+        let mut visited = HashSet::new();
+        let mut alternatives = HashMap::new();
+
+        while let Some(pkg) = worklist.pop() {
+            if visited.contains(&pkg) { continue; }
+            visited.insert(pkg.clone());
+
+            // جلب التبعيات من الفهرس
+            let deps = self.fetch_dependencies(&pkg).await?;
+
+            for dep in deps {
+                if dep.is_or() {
+                    // OR dependency: جمع كل البدائل
+                    let alts = self.find_alternatives(&dep).await?;
+                    alternatives.insert(dep.name.clone(), alts);
+                    // اختيار الأول افتراضياً
+                    worklist.push(alts[0].package_id.clone());
+                } else {
+                    worklist.push(dep.package_id);
+                }
+            }
+        }
+
+        // Phase 2: PubGrub SAT solving
+        let mut graph = self.run_pubgrub(&request.root, &alternatives).await?;
+
+        // Phase 3: كشف الدورات (Tarjan's algorithm)
+        graph.cycles = self.detect_cycles(&graph.topological_order)?;
+
+        // Phase 4: فحص التعارضات (file conflicts, version conflicts)
+        graph.metadata_conflicts = self.detect_conflicts(&graph).await?;
+
+        // Phase 5: حل الـ unresolved
+        graph.unresolved = self.classify_unresolved(&graph)?;
+
+        Ok(graph)
+    }
+
+    async fn run_pubgrub(&self, root: &PackageId, alternatives: &HashMap<...>) -> Result<ResolvedGraph> {
+        // استخدام pubgrub crate مع provider مخصص
+        let provider = SpmProvider::new(self.index.clone(), self.repos.clone());
+        let solution = pubgrub::resolve(&provider, root.name.clone(), root.version.clone())?;
+
+        // تحويل الحل لـ PackageId list مع تنسيق صحيح
+        let packages = solution.into_iter()
+            .map(|(name, version)| self.map_to_package_id(&name, &version, alternatives))
+            .collect();
+
+        Ok(ResolvedGraph {
+            topological_order: self.topological_sort(packages)?,
+            // ...
+        })
+    }
+
+    async fn find_alternatives(&self, dep: &Dependency) -> Result<Vec<Alternative>> {
+        // البحث في جميع المستودعات عن حزم توفر هذا الـ SONAME/اسم
+        let mut alts = Vec::new();
+        for repo in &self.repos {
+            let providers = self.index.get_providers(&dep.name)?;
+            for p in providers {
+                if self.version_satisfies(&p.version, &dep.version_req)? {
+                    alts.push(Alternative {
+                        name: p.pkg.clone(),
+                        format: p.source.into(),
+                        version: p.version,
+                        source: p.source,
+                        priority: p.priority,
+                    });
+                }
+            }
+        }
+        // ترتيب حسب الأولوية
+        alts.sort_by_key(|a| a.priority);
+        Ok(alts)
+    }
+}
+```
+
+#### **3.3 Dependency Cache مع Epoch**
+
+```rust
+// src/package/resolver/cache.rs
+
+pub struct DependencyCache {
+    db: sled::Db,  // embedded key-value store
+    epoch: AtomicU64,
+    ttl: Duration,
+}
+
+impl DependencyCache {
+    pub fn new(path: &Path) -> Result<Self> {
+        let db = sled::open(path)?;
+        let epoch = db.get("__epoch__")?
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        Ok(Self { db, epoch: AtomicU64::new(epoch), ttl: Duration::from_secs(300) })
+    }
+
+    pub fn bump_epoch(&self) {
+        let new_epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.db.insert("__epoch__", new_epoch.to_le_bytes());
+    }
+
+    pub fn get(&self, key: &str) -> Option<CachedDeps> {
+        let data = self.db.get(key).ok()??;
+        let cached: CachedDeps = bincode::deserialize(&data).ok()?;
+
+        // فحص TTL و epoch
+        if cached.epoch != self.epoch.load(Ordering::Relaxed) {
+            return None;  // epoch تغير - cache غير صالح
+        }
+        if cached.timestamp.elapsed() > self.ttl {
+            return None;  // منتهي الصلاحية
+        }
+        Some(cached)
+    }
+
+    pub fn set(&self, key: &str, deps: Vec<Dependency>) {
+        let cached = CachedDeps {
+            deps,
+            epoch: self.epoch.load(Ordering::Relaxed),
+            timestamp: SystemTime::now(),
+        };
+        let _ = self.db.insert(key, bincode::serialize(&cached).unwrap());
+    }
+}
+```
+
+---
+
+### **🧪 المرحلة 4: Sandbox & Isolation Engine (أسبوع 4)**
+
+#### **4.1 Namespace Isolation (Pure Linux, No chroot)**
+
+```rust
+// src/package/sandbox/namespaces.rs
+
+pub struct SandboxBuilder {
+    level: SandboxLevel,
+    namespaces: NamespaceSet,
+    seccomp_profile: Option<SeccompProfile>,
+    landlock_rules: Option<LandlockRules>,
+    cgroup_limits: Option<CgroupLimits>,
+    mounts: Vec<MountSpec>,
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SandboxLevel {
+    None,       // بدون عزل
+    Standard,   // PID + Mount(private) + Network(none) + UTS
+    Strict,     // Standard + User NS + Seccomp + Landlock
+    Full,       // Strict + Cgroup limits (memory, cpu, pids)
+}
+
+impl SandboxBuilder {
+    pub fn new(level: SandboxLevel) -> Self {
+        let mut namespaces = NamespaceSet::empty();
+
+        match level {
+            SandboxLevel::None => {}
+            SandboxLevel::Standard => {
+                namespaces |= CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS;
+            }
+            SandboxLevel::Strict => {
+                namespaces |= CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWUSER;
+            }
+            SandboxLevel::Full => {
+                namespaces |= CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWCGROUP;
+            }
+        }
+
+        Self {
+            level,
+            namespaces,
+            seccomp_profile: if level >= SandboxLevel::Strict { Some(SeccompProfile::default_allowlist()) } else { None },
+            landlock_rules: if level >= SandboxLevel::Strict { Some(LandlockRules::default()) } else { None },
+            cgroup_limits: if level == SandboxLevel::Full { Some(CgroupLimits::default()) } else { None },
+            mounts: Vec::new(),
+            env: HashMap::new(),
+        }
+    }
+
+    pub fn add_mount(mut self, spec: MountSpec) -> Self {
+        self.mounts.push(spec);
+        self
+    }
+
+    pub fn set_env(mut self, key: String, value: String) -> Self {
+        self.env.insert(key, value);
+        self
+    }
+
+    pub fn spawn(self, cmd: &str, args: &[&str]) -> Result<SandboxProcess> {
+        let mut child = Command::new(cmd);
+        child.args(args);
+
+        // إعداد البيئة
+        for (k, v) in &self.env {
+            child.env(k, v);
+        }
+
+        // Pre-exec: يتم بعد fork وقبل exec
+        unsafe {
+            child.pre_exec(move || {
+                // 1. Unshare namespaces
+                unshare(self.namespaces.bits())?;
+
+                // 2. Mount namespace setup
+                if self.namespaces.contains(CLONE_NEWNS) {
+                    // Make mounts private
+                    mount(None, "/", None, MS_PRIVATE | MS_REC, None)?;
+
+                    // Apply custom mounts
+                    for spec in &self.mounts {
+                        spec.apply()?;
+                    }
+
+                    // Remount root readonly
+                    mount(None, "/", None, MS_REMOUNT | MS_RDONLY | MS_BIND, None)?;
+                }
+
+                // 3. User namespace mapping (للـ Strict/Full)
+                if self.namespaces.contains(CLONE_NEWUSER) {
+                    setup_user_namespace_mapping()?;
+                }
+
+                // 4. Network namespace (لا شبكة)
+                if self.namespaces.contains(CLONE_NEWNET) {
+                    // لا حاجة لإعداد - معزول افتراضياً
+                }
+
+                // 5. UTS namespace (hostname)
+                if self.namespaces.contains(CLONE_NEWUTS) {
+                    sethostname("sandbox")?;
+                }
+
+                // 6. Seccomp filter
+                if let Some(profile) = &self.seccomp_profile {
+                    profile.apply()?;
+                }
+
+                // 7. Landlock rules
+                if let Some(rules) = &self.landlock_rules {
+                    rules.apply()?;
+                }
+
+                // 8. Drop capabilities
+                drop_all_capabilities()?;
+
+                // 9. Resource limits
+                set_rlimits()?;
+
+                Ok(())
+            });
+        }
+
+        let child = child.spawn()?;
+        Ok(SandboxProcess { child, level: self.level })
+    }
+}
+
+// Seccomp Profile - Allowlist آمن
+pub struct SeccompProfile {
+    allowed_syscalls: HashSet<i32>,
+}
+
+impl SeccompProfile {
+    pub fn default_allowlist() -> Self {
+        // قائمة syscalls المسموحة للتشغيل الأساسي
+        let mut allowed = HashSet::new();
+        // Basic: read, write, open, close, stat, fstat, lstat, poll, mmap, munmap, brk, rt_sigaction, rt_sigprocmask, sigreturn, exit, exit_group, getpid, getuid, geteuid, getgid, getegid, getppid, getpgrp, gettid, sysinfo, uname, clock_gettime, gettimeofday, nanosleep, sched_yield, getrusage, getrlimit, setrlimit, prlimit64, capget, capset, personality, arch_prctl, futex, set_tid_address, set_robust_list, get_robust_list, tgkill, tkill, sched_getaffinity, sched_setaffinity
+        allowed.extend([
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22, 23, 24, 25, 35, 36, 37, 38, 39, 40, 41, 42, 43, 47, 48, 56, 57, 58, 59, 60, 61, 62, 63, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 290, 291, 292, 293,
+        ]);
+        Self { allowed_syscalls: allowed }
+    }
+
+    pub fn apply(&self) -> Result<()> {
+        let mut filter = seccomp::SeccompFilter::new(seccomp::SeccompAction::KillProcess)?;
+        for &syscall in &self.allowed_syscalls {
+            filter.add_rule(syscall, seccomp::SeccompAction::Allow)?;
+        }
+        filter.load()?;
+        Ok(())
+    }
+}
+```
+
+#### **4.2 Landlock Rules (Filesystem Access Control)**
+
+```rust
+// src/package/sandbox/landlock.rs
+
+pub struct LandlockRules {
+    rules: Vec<LandlockRule>,
+}
+
+#[derive(Clone)]
+pub struct LandlockRule {
+    path: PathBuf,
+    access: AccessFs,  // Read, Write, Execute
+}
+
+impl LandlockRules {
+    pub fn default() -> Self {
+        Self { rules: Vec::new() }
+    }
+
+    pub fn allow_read(mut self, path: &Path) -> Self {
+        self.rules.push(LandlockRule { path: path.to_path_buf(), access: AccessFs::Read });
+        self
+    }
+
+    pub fn allow_write(mut self, path: &Path) -> Self {
+        self.rules.push(LandlockRule { path: path.to_path_buf(), access: AccessFs::Write });
+        self
+    }
+
+    pub fn allow_exec(mut self, path: &Path) -> Self {
+        self.rules.push(LandlockRule { path: path.to_path_buf(), access: AccessFs::Execute });
+        self
+    }
+
+    pub fn apply(&self) -> Result<()> {
+        let mut ruleset = landlock::Ruleset::new()?;
+
+        for rule in &self.rules {
+            let path_fd = fs::File::open(&rule.path)?;
+            let mut path_beneath = landlock::PathBeneath::new(path_fd, rule.access.bits());
+            ruleset.add_rule(path_beneath)?;
+        }
+
+        ruleset.restrict_self()?;
+        Ok(())
+    }
+}
+```
+
+---
+
+### **🤝 المرحلة 5: Coexistence & Conflict Detection (أسبوع 5)**
+
+#### **5.1 inotify-based Detection**
+
+```rust
+// src/isolation/detector.rs
+
+pub struct PackageManagerDetector {
+    watcher: notify::RecommendedWatcher,
+    watched_paths: HashSet<PathBuf>,
+    event_tx: mpsc::Sender<DetectionEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DetectionEvent {
+    ForeignInstallStarted {
+        manager: PackageManager,  // Apt, Dnf, Pacman, etc.
+        package: String,
+        process_id: u32,
+    },
+    ForeignFileCreated {
+        manager: PackageManager,
+        path: PathBuf,
+        process_id: u32,
+    },
+    SpmFileTouched {
+        path: PathBuf,
+        foreign_manager: PackageManager,
+        process_id: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    Apt,
+    Dnf,
+    Rpm,
+    Dpkg,
+    Pacman,
+    Zypper,
+    Apk,
+    Spm,
+    Unknown,
+}
+
+impl PackageManagerDetector {
+    pub fn new(event_tx: mpsc::Sender<DetectionEvent>) -> Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(tx)?;
+
+        // المسارات القياسية للمراقبة
+        let paths = vec![
+            ("/var/lib/dpkg", PackageManager::Dpkg),
+            ("/var/lib/apt", PackageManager::Apt),
+            ("/var/lib/rpm", PackageManager::Rpm),
+            ("/var/cache/dnf", PackageManager::Dnf),
+            ("/var/lib/pacman", PackageManager::Pacman),
+            ("/var/cache/apk", PackageManager::Apk),
+            ("/usr/bin", PackageManager::Unknown),  // مراقبة عامة
+            ("/usr/sbin", PackageManager::Unknown),
+            ("/usr/local/bin", PackageManager::Unknown),
+        ];
+
+        for (path, mgr) in &paths {
+            if Path::new(path).exists() {
+                watcher.watch(Path::new(path), notify::RecursiveMode::Recursive)?;
+            }
+        }
+
+        Ok(Self { watcher, watched_paths: paths.iter().map(|(p,_)| PathBuf::from(*p)).collect(), event_tx })
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let mut rx = self.event_tx.subscribe();
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                notify::Event { kind: EventKind::Create(_), paths, .. } => {
+                    for path in paths {
+                        self.analyze_creation(&path).await?;
+                    }
+                }
+                notify::Event { kind: EventKind::Modify(_), paths, .. } => {
+                    for path in paths {
+                        self.analyze_modification(&path).await?;
+                    }
+                }
+                notify::Event { kind: EventKind::Access(_), paths, .. } => {
+                    for path in paths {
+                        self.analyze_access(&path).await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn analyze_creation(&self, path: &Path) -> Result<()> {
+        // معرفة أي عملية أنشأت الملف
+        let pid = self.get_creator_pid(path).await?;
+        let manager = self.identify_manager(pid).await?;
+
+        if manager != PackageManager::Spm && manager != PackageManager::Unknown {
+            // تثبيت أجنبي
+            let package = self.extract_package_name(path, manager).await?;
+            self.event_tx.send(DetectionEvent::ForeignInstallStarted {
+                manager, package, process_id: pid
+            }).await?;
+        }
+
+        // فحص إذا الملف مملوك لـ SPM
+        if self.is_spm_owned(path).await? {
+            if manager != PackageManager::Spm {
+                self.event_tx.send(DetectionEvent::SpmFileTouched {
+                    path: path.to_path_buf(),
+                    foreign_manager: manager,
+                    process_id: pid
+                }).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+#### **5.2 Process Freezer (SIGSTOP/SIGCONT)**
+
+```rust
+// src/isolation/freezer.rs
+
+pub struct ProcessFreezer;
+
+impl ProcessFreezer {
+    /// تجميد عملية (إرسال SIGSTOP)
+    pub fn freeze(pid: u32) -> Result<()> {
+        // التحقق من الصلاحية
+        if !Self::can_control(pid)? {
+            return Err(Error::PermissionDenied);
+        }
+
+        // SIGSTOP - لا يمكن تجاهله
+        unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+
+        // انتظار التأكد من التوقف
+        Self::wait_stop_loop:
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(10));
+            if Self::is_stopped(pid)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// استئناف عملية (إرسال SIGCONT)
+    pub fn unfreeze(pid: u32) -> Result<()> {
+        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        Ok(())
+    }
+
+    /// قتل عملية (SIGTERM ثم SIGKILL)
+    pub fn kill(pid: u32, graceful: bool) -> Result<()> {
+        if graceful {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            // انتظار 5 ثواني
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                if !Self::is_alive(pid)? {
+                    return Ok(());
+                }
+            }
+        }
+        // Force kill
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        Ok(())
+    }
+
+    fn can_control(pid: u32) -> Result<bool> {
+        // فحص إذا العملية تابعة للمستخدم الحالي أو نحن root
+        let uid = unsafe { libc::getuid() };
+        if uid == 0 { return Ok(true); }
+
+        // قراءة /proc/PID/status للتحقق من UID
+        let status = fs::read_to_string(format!("/proc/{}/status", pid))?;
+        for line in status.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let real_uid = parts[1].parse::<u32>()?;
+                    return Ok(real_uid == uid);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+```
+
+#### **5.3 Conflict Mediator - Zypper-like Intelligence**
+
+```rust
+// src/package/install/conflict.rs
+
+pub struct ConflictMediator {
+    detector: PackageManagerDetector,
+    freezer: ProcessFreezer,
+    store: StoreManager,
+}
+
+impl ConflictMediator {
+    /// التعامل مع سيناريو: SPM يريد تثبيت حزمة لكن مدير حزم آخر يملكها
+    pub async fn handle_foreign_owned(&self, pkg_name: &str, foreign_mgr: PackageManager) -> Result<Resolution> {
+        // 1. جمع معلومات الحزمة الأجنبية
+        let foreign_info = self.detector.get_package_info(pkg_name, foreign_mgr).await?;
+
+        // 2. عرض الخيارات للمستخدم
+        let options = vec![
+            ResolutionOption::UserRemovesForeign {
+                description: format!("إزالة {} يدوياً (عبر {} remove {})", pkg_name, foreign_mgr.cli_name(), pkg_name),
+                command: format!("{} remove {}", foreign_mgr.cli_name(), pkg_name),
+                risk: RiskLevel::Low,
+            },
+            ResolutionOption::SandboxInstall {
+                description: format!("تثبيت {} في Sandbox معزول", pkg_name),
+                command: format!("spm install --sandbox {}", pkg_name),
+                risk: RiskLevel::None,
+            },
+            ResolutionOption::ForceReplace {
+                description: "إزالة الحزمة الأجنبية وتثبيت نسخة SPM (خطر: قد يكسر تطبيقات أخرى)",
+                command: format!("spm install --replace {}", pkg_name),
+                risk: RiskLevel::High,
+            },
+            ResolutionOption::Cancel {
+                description: "إلغاء التثبيت",
+                command: String::new(),
+                risk: RiskLevel::None,
+            },
+        ];
+
+        // 3. عرض واجهة تفاعلية جميلة
+        self.show_conflict_ui(pkg_name, foreign_mgr, &foreign_info, &options).await?;
+
+        // 4. الحصول على اختيار المستخدم
+        let choice = self.prompt_user_choice(&options).await?;
+
+        match choice {
+            ResolutionOption::UserRemovesForeign { command, .. } => {
+                // طلب من المستخدم تشغيل الأمر
+                println!("{}", style("يرجى تشغيل الأمر التالي يدوياً:").yellow());
+                println!("  {}", style(&command).cyan().bold());
+                println!("{}", style("ثم اضغط Enter للمتابعة...").dim());
+                let _ = std::io::stdin().read_line(&mut String::new());
+
+                // التحقق من الإزالة
+                if self.detector.is_package_installed(pkg_name, foreign_mgr).await? {
+                    return Err(Error::ForeignPackageStillExists);
+                }
+                Ok(Resolution::Proceed)
+            }
+            ResolutionOption::SandboxInstall { .. } => {
+                Ok(Resolution::SandboxInstall)
+            }
+            ResolutionOption::ForceReplace { .. } => {
+                // SPM يزيل آثار الحزمة الأجنبية
+                self.cleanup_foreign_package(pkg_name, foreign_mgr).await?;
+                Ok(Resolution::Proceed)
+            }
+            ResolutionOption::Cancel => Ok(Resolution::Cancelled),
+        }
+    }
+
+    /// التعامل مع سيناريو: مدير حزم أجنبي يحاول لمس ملفات SPM
+    pub async fn handle_foreign_touch_spm_file(&self, path: &Path, foreign_mgr: PackageManager, pid: u32) -> Result<()> {
+        // 1. تجميد العملية فوراً
+        self.freezer.freeze(pid)?;
+
+        // 2. تحديد الحزمة المتأثرة
+        let spm_pkg = self.store.find_package_owning_file(path).await?
+            .ok_or(Error::FileNotOwnedBySpm)?;
+
+        // 3. عرض تحذير للمستخدم في نفس التيرمينال
+        println!("\n{}", style("⚠  تحذير: محاولة تعديل ملفات SPM").red().bold());
+        println!("  {}", style("الملف:").bold());
+        println!("    {}", style(path.display()).cyan());
+        println!("  {}", style("المملوك لحزمة SPM:").bold());
+        println!("    {}", style(&spm_pkg).green());
+        println!("  {}", style("العملية الغريبة:").bold());
+        println!("    {} (PID: {})", style(foreign_mgr.cli_name()).yellow(), pid);
+
+        // 4. خيارات
+        let options = vec![
+            "السماح بالتعديل (إزالة حماية SPM والسماح لـ {} بالمتابعة)".to_string(),
+            "رفض التعديل (قتل عملية {})".to_string(),
+            "تثبيت الحزمة في Sandbox بدلاً من ذلك".to_string(),
+        ];
+
+        let choice = self.prompt_select(&options).await?;
+
+        match choice {
+            0 => {
+                // السماح: إزالة حماية SPM للملف
+                self.store.remove_file_protection(path).await?;
+                self.freezer.unfreeze(pid)?;
+                println!("{}", style("✓ تم السماح بالتعديل").green());
+            }
+            1 => {
+                // الرفض: قتل العملية
+                self.freezer.kill(pid, true)?;
+                println!("{}", style("✓ تم قتل العملية").green());
+            }
+            2 => {
+                // Sandbox
+                self.freezer.kill(pid, true)?;
+                // تشغيل تثبيت sandbox
+                self.install_in_sandbox(&spm_pkg).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+---
+
+### **🧠 المرحلة 6: SPMD - الدماغ المركزي (أسبوع 6)**
+
+#### **6.1 Permission Engine**
+
+```rust
+// src/daemon/permission.rs
+
+pub struct PermissionEngine {
+    policy: PermissionPolicy,
+    audit_log: AuditLogger,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionPolicy {
+    pub root_can_everything: bool,
+    pub group_spm_can_system: bool,
+    pub users_can_user_install: bool,
+    pub sandbox_required_for: Vec<String>,  // حزم تتطلب sandbox
+    pub blocked_packages: Vec<String>,      // حزم محظورة
+    pub max_concurrent_per_user: u32,
+    pub rate_limit_per_user: u32,  // requests/second
+}
+
+impl PermissionEngine {
+    pub fn check(&self, request: &DaemonRequest, creds: &PeerCreds) -> Result<Permission> {
+        let uid = creds.uid;
+        let gid = creds.gid;
+        let groups = creds.groups;
+
+        // 1. Root check
+        if uid == 0 {
+            if self.policy.root_can_everything {
+                return Ok(Permission::SystemFull);
+            }
+        }
+
+        // 2. Group spm check
+        if groups.contains(&SPM_GID) || gid == SPM_GID {
+            if self.policy.group_spm_can_system {
+                return match request.action.as_str() {
+                    "install" | "remove" | "upgrade" | "repo" | "snapshot" | "cleanup" => {
+                        Ok(Permission::SystemFull)
+                    }
+                    _ => Ok(Permission::ReadOnly),
+                };
+            }
+        }
+
+        // 3. User install
+        if self.policy.users_can_user_install {
+            return match request.action.as_str() {
+                "install" | "remove" | "list" => {
+                    Ok(Permission::UserOnly { uid, home: self.get_user_home(uid)? })
+                }
+                _ => Ok(Permission::Denied),
+            };
+        }
+
+        Ok(Permission::Denied)
+    }
+
+    pub fn check_file_access(&self, path: &Path, creds: &PeerCreds) -> Result<FileAccess> {
+        // فحص إذا الملف مملوك لـ SPM
+        if self.store.is_owned_by_spm(path)? {
+            let owner_pkg = self.store.find_owner(path)?;
+            let owner_creds = self.store.get_package_credentials(&owner_pkg)?;
+
+            // هل العملية الطالبة لها نفس UID/GID كمالك الحزمة؟
+            if creds.uid == owner_creds.uid && creds.gid == owner_creds.gid {
+                return Ok(FileAccess::Allowed);
+            }
+
+            // عملية أجنبية تحاول الوصول
+            return Ok(FileAccess::ForeignTouch { owner_pkg, owner_creds });
+        }
+
+        Ok(FileAccess::NotOwnedBySpm)
+    }
+}
+```
+
+#### **6.2 Transaction Manager (Atomic, Rollback-safe)**
+
+```rust
+// src/daemon/transaction.rs
+
+pub struct TransactionManager {
+    store: StoreManager,
+    db: Database,
+    hooks: HookRunner,
+    sandbox_launcher: SandboxLauncher,
+}
+
+impl TransactionManager {
+    pub async fn execute_install(&self, plan: InstallPlan, creds: PeerCreds) -> Result<TransactionResult> {
+        let tx_id = self.db.begin_transaction()?;
+
+        // Rollback guard
+        let mut rollback = RollbackGuard::new(tx_id, &self.db);
+
+        // Phase 1: Fetch & Verify (يمكن التوازي)
+        let fetched = self.fetch_all_packages(&plan).await?;
+        self.verify_all_packages(&fetched).await?;
+
+        // Phase 2: Conflict Detection
+        let conflicts = self.detect_conflicts(&fetched).await?;
+        if !conflicts.is_empty() {
+            return self.handle_conflicts(conflicts, &plan).await;
+        }
+
+        // Phase 3: Prepare Store (copy to store, deduplicate)
+        let store_entries = self.prepare_store(&fetched).await?;
+
+        // Phase 4: Run Pre-install Scripts (في Sandbox إذا مطلوب)
+        self.run_preinstall_scripts(&fetched, &plan.sandbox_level).await?;
+
+        // Phase 5: Atomic Filesystem Deployment
+        self.deploy_files(&store_entries, &plan.sandbox_level).await?;
+
+        // Phase 6: Database Commit (Atomic)
+        self.commit_transaction(tx_id, &plan, &store_entries).await?;
+
+        // Phase 7: Post-install
+        rollback.disarm();  // لا rollback بعد commit
+        self.run_postinstall_scripts(&fetched).await?;
+        self.run_hooks(&plan.installed_packages).await?;
+
+        Ok(TransactionResult::Success { packages: plan.packages })
+    }
+
+    async fn handle_conflicts(&self, conflicts: Vec<Conflict>, plan: &InstallPlan) -> Result<TransactionResult> {
+        // إذا المستخدم root/spm group -> عرض خيارات Zypper-like
+        // إذا المستخدم عادي -> فقط Sandbox أو Cancel
+        let mediator = ConflictMediator::new(self.store.clone());
+        let resolution = mediator.mediate(conflicts, plan).await?;
+
+        match resolution {
+            Resolution::SandboxInstall => {
+                // إعادة التخطيط مع sandbox
+                let sandbox_plan = plan.with_sandbox(SandboxLevel::Standard);
+                Box::pin(self.execute_install(sandbox_plan, creds)).await
+            }
+            Resolution::ForceReplace => {
+                // إزالة الحزم المتعارضة ثم المتابعة
+                self.remove_conflicting_packages(&resolution.packages_to_remove).await?;
+                Box::pin(self.execute_install(plan, creds)).await
+            }
+            Resolution::Cancelled => Ok(TransactionResult::Cancelled),
+        }
+    }
+}
+```
+
+#### **6.3 SPMD Main Loop مع Socket Activation**
+
+```rust
+// src/daemon/mod.rs
+
+pub async fn run_daemon() -> Result<()> {
+    // تهيئة المكونات
+    let permission_engine = PermissionEngine::new(load_policy()?);
+    let store = StoreManager::new()?;
+    let detector = PackageManagerDetector::new(event_tx)?;
+    let freezer = ProcessFreezer;
+    let transaction_mgr = TransactionManager::new(store.clone())?;
+    let conflict_mediator = ConflictMediator::new(detector, freezer, store.clone())?;
+
+    // Spawn detector task
+    tokio::spawn(async move {
+        detector.run().await.unwrap();
+    });
+
+    // Spawn event handler
+    let mediator = conflict_mediator.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                DetectionEvent::ForeignInstallStarted { manager, package, process_id } => {
+                    // مجرد تسجيل - التعامل عند محاولة SPM تثبيت نفس الحزمة
+                    tracing::info!("Foreign install detected: {} by {:?} (PID: {})", package, manager, process_id);
+                }
+                DetectionEvent::SpmFileTouched { path, foreign_manager, process_id } => {
+                    // تجميد ووساطة فورية
+                    if let Err(e) = mediator.handle_foreign_touch_spm_file(&path, foreign_manager, process_id).await {
+                        tracing::error!("Failed to mediate foreign touch: {}", e);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Socket Activation
+    let listener = if let Some(std_listener) = try_systemd_socket_activation()? {
+        tokio::net::UnixListener::from_std(std_listener)?
+    } else {
+        let sock_path = "/run/spm.sock";
+        let _ = fs::remove_file(sock_path);
+        let l = tokio::net::UnixListener::bind(sock_path)?;
+        fs::set_permissions(sock_path, fs::Permissions::from_mode(0o660))?;  // group spm
+        l
+    };
+
+    tracing::info!("spmd listening on /run/spm.sock");
+
+    // Main accept loop
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let creds = get_peer_creds(&stream)?;
+
+        let permission_engine = permission_engine.clone();
+        let transaction_mgr = transaction_mgr.clone();
+
+        tokio::spawn(async move {
+            handle_connection(stream, creds, permission_engine, transaction_mgr).await;
+        });
+    }
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    creds: PeerCreds,
+    permission_engine: PermissionEngine,
+    transaction_mgr: TransactionManager,
+) {
+    // قراءة الطلب
+    let request = read_request(&mut stream).await?;
+
+    // فحص الصلاحيات
+    let permission = permission_engine.check(&request, &creds)?;
+    if permission == Permission::Denied {
+        send_response(&mut stream, DaemonResponse::error("Permission denied")).await;
+        return;
+    }
+
+    // تنفيذ الطلب
+    let result = match request.action.as_str() {
+        "install" => transaction_mgr.execute_install(request.into_plan()?, creds).await,
+        "remove" => transaction_mgr.execute_remove(request.package.unwrap(), permission).await,
+        "upgrade" => transaction_mgr.execute_upgrade(request.package, permission).await,
+        "repo" => handle_repo_request(request, permission).await,
+        "snapshot" => handle_snapshot_request(request, permission).await,
+        _ => Err(Error::UnknownAction),
+    };
+
+    send_response(&mut stream, result.into()).await;
+}
+```
+
+---
+
+### **🖥️ المرحلة 7: Layer d'intégration système (Semaine 7)**
+
+#### **7.1 Commandes système de base**
+
+```rust
+// src/integraton/mod.rs
+
+pub struct SystemIntegration {
+    nix: nix::Nix,
+    goblin: goblin::Goblin,
+    object: object::Object,
+    btrfs_util: libbtrfsutil_sys::BtrfsUtil,
+    systemd: systemd::Systemd,
+    desktop_file_utils: desktop_file_utils::DesktopFileUtils,
+    mandb: mandb::Mandb,
+}
+
+impl SystemIntegration {
+    /// قراءة معلومات kernel (uname)
+    /// بديل لـ: uname في src/util/fs.rs:18
+    pub fn get_kernel_info(&self) -> Result<KernelInfo> {
+        let mut info = KernelInfo {
+            sysname: String::new(),
+            nodename: String::new(),
+            release: String::new(),
+            version: String::new(),
+            machine: String::new(),
+        };
+
+        let mut utsname = nix::libc::utsname {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+            domainname: [0; 65],
+        };
+
+        unsafe { nix::libc::uname(&mut utsname) };
+
+        info.sysname = String::from_utf8_lossy(&utsname.sysname[..]).trim_end().to_string();
+        info.nodename = String::from_utf8_lossy(&utsname.nodename[..]).trim_end().to_string();
+        info.release = String::from_utf8_lossy(&utsname.release[..]).trim_end().to_string();
+        info.version = String::from_utf8_lossy(&utsname.version[..]).trim_end().to_string();
+        info.machine = String::from_utf8_lossy(&utsname.machine[..]).trim_end().to_string();
+
+        Ok(info)
+    }
+
+    /// تحليل ملف ELF (بديل لـ readelf)
+    /// بديل لـ: readelf في src/package/sam.rs:187
+    pub fn analyze_elf(&self, path: &Path) -> Result<ElfAnalysis> {
+        let file = fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut elf_bytes = Vec::new();
+        reader.read_to_end(&mut elf_bytes)?;
+
+        // استخدام goblin crate لتحليل ELF
+        let elf = goblin::elf::Elf::parse(&elf_bytes)?;
+
+        let mut analysis = ElfAnalysis {
+            architecture: elf.header.e_machine,
+            entry_point: elf.header.e_entry,
+            program_headers: Vec::new(),
+            section_headers: Vec::new(),
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            relocations: Vec::new(),
+            dynamic: Vec::new(),
+            strtab: Vec::new(),
+            shstrtab: Vec::new(),
+        };
+
+        for ph in &elf.program_headers {
+            analysis.program_headers.push(ProgramHeader {
+                p_type: ph.p_type,
+                p_offset: ph.p_offset,
+                p_vaddr: ph.p_vaddr,
+                p_paddr: ph.p_paddr,
+                p_filesz: ph.p_filesz,
+                p_memsz: ph.p_memsz,
+                p_flags: ph.p_flags,
+                p_align: ph.p_align,
+            });
+        }
+
+        for sh in &elf.section_headers {
+            analysis.section_headers.push(SectionHeader {
+                sh_name: sh.sh_name,
+                sh_type: sh.sh_type,
+                sh_flags: sh.sh_flags,
+                sh_addr: sh.sh_addr,
+                sh_offset: sh.sh_offset,
+                sh_size: sh.sh_size,
+                sh_link: sh.sh_link,
+                sh_info: sh.sh_info,
+                sh_addralign: sh.sh_addralign,
+                sh_entsize: sh.sh_entsize,
+            });
+        }
+
+        // استخراج الرموز
+        if let Some(strtab) = elf.shdr_strtab(&elf.section_headers) {
+            analysis.shstrtab = strtab.clone();
+        }
+
+        if let Some(strtab) = elf.strtab() {
+            analysis.strtab = strtab.clone();
+        }
+
+        // تحليل القسم الديناميكي (symbols, relocations, etc.)
+        self.extract_dynamic_info(&elf, &mut analysis)?;
+
+        Ok(analysis)
+    }
+
+    /// أدوات ELF (بديل لـ patchelf)
+    /// بديل لـ: patchelf في src/package/store.rs:265
+    pub fn apply_elf_patches(&self, path: &Path, patches: &[ElfPatch]) -> Result<()> {
+        let file = fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut elf_bytes = Vec::new();
+        reader.read_to_end(&mut elf_bytes)?;
+
+        // استخدام object crate لتعديل ELF
+        let mut obj = object::read::File::parse(&elf_bytes)?;
+
+        for patch in patches {
+            match patch {
+                ElfPatch::SetRPATH(new_rpath) => {
+                    // ربما يحتاج إلى تعديل .dynamic section
+                    // هذه عملية معقدة - يجب استخدام object crate
+                    self.set_rpath(&mut obj, new_rpath)?;
+                }
+                ElfPatch::AddRPath(new_rpath) => {
+                    self.add_rpath(&mut obj, new_rpath)?;
+                }
+                ElfPatch::SetSoname(new_soname) => {
+                    self.set_soname(&mut obj, new_soname)?;
+                }
+                ElfPatch::Relocate(relocation) => {
+                    self.apply_relocation(&mut obj, relocation)?;
+                }
+            }
+        }
+
+        // كتابة الظهر
+        let mut output = Vec::new();
+        obj.write(&mut output)?;
+        fs::write(path, output)?;
+
+        Ok(())
+    }
+
+    /// التحقق من التبعيات الديناميكية (بديل لـ ldd)
+    /// بديل لـ: ldd في src/analyze/mod.rs:254, src/package/install/sandbox.rs:281
+    pub fn get_dynamic_dependencies(&self, binary_path: &Path) -> Result<Vec<LibraryInfo>> {
+        let analysis = self.analyze_elf(binary_path)?;
+        let mut deps = Vec::new();
+
+        // الحصول على DT_NEEDED entries من header الديناميكي
+        if let Some(dt_needed) = &analysis.dynamic {
+            for entry in dt_needed {
+                if entry.d_tag == object::elf::DT_NEEDED {
+                    let lib_name = String::from_utf8_lossy(entry.d_val.as_slice()).to_string();
+                    // البحث عن المكتبة
+                    if let Some(path) = self.find_library(&lib_name) {
+                        deps.push(LibraryInfo {
+                            name: lib_name.clone(),
+                            path,
+                            hash: self.calculate_library_hash(&path),
+                        });
+                    } else {
+                        // لم يتم العثور - ربما غير مثبتة
+                        deps.push(LibraryInfo {
+                            name: lib_name.clone(),
+                            path: PathBuf::from(format!("/usr/lib/{}", lib_name)),
+                            hash: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(deps)
+    }
+
+    /// فحص dtbtrfs (بديل لـ btrfs command)
+    /// بديل لـ: btrfs في src/package/query.rs:398,420
+    pub fn list_filesystems(&self) -> Result<Vec<BtrfsFsInfo>> {
+        let mut filesystems = Vec::new();
+
+        // استخدام libbtrfsutil-sys للحصول على معلومات النظام
+        let status = btrfs_util.get_filesystem_status()?;
+
+        for fs in status.filesystems {
+            let info = BtrfsFsInfo {
+                mount_point: fs.mount_point,
+                total_size: fs.total_size,
+                used_size: fs.used_size,
+                available_size: fs.available_size,
+                used_percent: fs.used_percent,
+                subvol_count: fs.subvol_count,
+                file_count: fs.file_count,
+            };
+            filesystems.push(info);
+        }
+
+        Ok(filesystems)
+    }
+
+    /// تشغيل functions system user/group (بديل لـ systemd-sysusers + systemd-tmpfiles)
+    /// بديل لـ: systemd-sysusers + systemd-tmpfiles في src/package/hooks.rs:232,236
+    pub async fn setup_system_users(&self) -> Result<()> {
+        // استخدام systemd crate لتشغيل sysusers
+        systemd.setup_users().await
+    }
+
+    pub async fn setup_tmpfiles(&self) -> Result<()> {
+        // استخدام systemd crate لتشغيل tmpfiles
+        systemd.setup_tmpfiles().await
+    }
+
+    /// تحديث قاعدة بيانات man pages (بديل لـ mandb)
+    /// بديل لـ: mandb في src/package/hooks.rs:90
+    pub async fn update_man_pages(&self) -> Result<()> {
+        mandb.update().await
+    }
+
+    /// تحديث قاعدة بيانات desktop-file-utils (بديل لـ update-desktop-database)
+    /// بديل لـ: update-desktop-database في src/sandbox/desktop.rs:176,222, src/package/hooks.rs:83
+    pub async fn update_desktop_database(&self) -> Result<()> {
+        desktop_file_utils.update_database().await
+    }
+
+    /// فحص اتصال والوقت (بديل لـ uname)
+    /// بديل لـ: uname في src/util/fs.rs:18
+    pub fn check_system_info(&self) -> Result<SystemInfo> {
+        let kernel = self.get_kernel_info()?;
+        let os_release = self.read_os_release()?;
+        let memory = self.get_memory_info()?;
+        let cpu_info = self.get_cpu_info()?;
+
+        Ok(SystemInfo {
+            kernel,
+            os_release,
+            memory,
+            cpu_info,
+            uptime: self.get_uptime()?,
+            load_avg: self.get_load_avg()?,
+            temperature: self.get_temperature()?,
+        })
+    }
+}
+
+/// Updated todo section
+### **🧨 المرحلة 8: SPMD - الدماغ المركزي (أسبوع 6)**
+
+#### **8.1 Permission Engine**
+
+```rust
+// src/daemon/permission.rs
+
+pub struct PermissionEngine {
+    policy: PermissionPolicy,
+    audit_log: AuditLogger,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionPolicy {
+    pub root_can_everything: bool,
+    pub group_spm_can_system: bool,
+    pub users_can_user_install: bool,
+    pub sandbox_required_for: Vec<String>,  // حزم تتطلب sandbox
+    pub blocked_packages: Vec<String>,      // حزم محظورة
+    pub max_concurrent_per_user: u32,
+    pub rate_limit_per_user: u32,  // requests/second
+}
+
+impl PermissionEngine {
+    pub fn check(&self, request: &DaemonRequest, creds: &PeerCreds) -> Result<Permission> {
+        let uid = creds.uid;
+        let gid = creds.gid;
+        let groups = creds.groups;
+
+        // 1. Root check
+        if uid == 0 {
+            if self.policy.root_can_everything {
+                return Ok(Permission::SystemFull);
+            }
+        }
+
+        // 2. Group spm check
+        if groups.contains(&SPM_GID) || gid == SPM_GID {
+            if self.policy.group_spm_can_system {
+                return match request.action.as_str() {
+                    "install" | "remove" | "upgrade" | "repo" | "snapshot" | "cleanup" => {
+                        Ok(Permission::SystemFull)
+                    }
+                    _ => Ok(Permission::ReadOnly),
+                };
+            }
+        }
+
+        // 3. User install
+        if self.policy.users_can_user_install {
+            return match request.action.as_str() {
+                "install" | "remove" | "list" => {
+                    Ok(Permission::UserOnly { uid, home: self.get_user_home(uid)? })
+                }
+                _ => Ok(Permission::Denied),
+            };
+        }
+
+        Ok(Permission::Denied)
+    }
+
+    pub fn check_file_access(&self, path: &Path, creds: &PeerCreds) -> Result<FileAccess> {
+        // فحص إذا الملف مملوك لـ SPM
+        if self.store.is_owned_by_spm(path)? {
+            let owner_pkg = self.store.find_owner(path)?;
+            let owner_creds = self.store.get_package_credentials(&owner_pkg)?;
+
+            // هل العملية الطالبة لها نفس UID/GID كمالك الحزمة؟
+            if creds.uid == owner_creds.uid && creds.gid == owner_creds.gid {
+                return Ok(FileAccess::Allowed);
+            }
+
+            // عملية أجنبية تحاول الوصول
+            return Ok(FileAccess::ForeignTouch { owner_pkg, owner_creds });
+        }
+
+        Ok(FileAccess::NotOwnedBySpm)
+    }
+}
+```
+
+#### **8.2 Transaction Manager (Atomic, Rollback-safe)**
+
+```rust
+// src/daemon/transaction.rs
+
+pub struct TransactionManager {
+    store: StoreManager,
+    db: Database,
+    hooks: HookRunner,
+    sandbox_launcher: SandboxLauncher,
+}
+
+impl TransactionManager {
+    pub async fn execute_install(&self, plan: InstallPlan, creds: PeerCreds) -> Result<TransactionResult> {
+        let tx_id = self.db.begin_transaction()?;
+
+        // Rollback guard
+        let mut rollback = RollbackGuard::new(tx_id, &self.db);
+
+        // Phase 1: Fetch & Verify (يمكن التوازي)
+        let fetched = self.fetch_all_packages(&plan).await?;
+        self.verify_all_packages(&fetched).await?;
+
+        // Phase 2: Conflict Detection
+        let conflicts = self.detect_conflicts(&fetched).await?;
+        if !conflicts.is_empty() {
+            return self.handle_conflicts(conflicts, &plan).await;
+        }
+
+        // Phase 3: Prepare Store (copy to store, deduplicate)
+        let store_entries = self.prepare_store(&fetched).await?;
+
+        // Phase 4: Run Pre-install Scripts (في Sandbox إذا مطلوب)
+        self.run_preinstall_scripts(&fetched, &plan.sandbox_level).await?;
+
+        // Phase 5: Atomic Filesystem Deployment
+        self.deploy_files(&store_entries, &plan.sandbox_level).await?;
+
+        // Phase 6: Database Commit (Atomic)
+        self.commit_transaction(tx_id, &plan, &store_entries).await?;
+
+        // Phase 7: Post-install
+        rollback.disarm();  // لا rollback بعد commit
+        self.run_postinstall_scripts(&fetched).await?;
+        self.run_hooks(&plan.installed_packages).await?;
+
+        Ok(TransactionResult::Success { packages: plan.packages })
+    }
+
+    async fn handle_conflicts(&self, conflicts: Vec<Conflict>, plan: &InstallPlan) -> Result<TransactionResult> {
+        // إذا المستخدم root/spm group -> عرض خيارات Zypper-like
+        // إذا المستخدم عادي -> فقط Sandbox أو Cancel
+        let mediator = ConflictMediator::new(self.store.clone());
+        let resolution = mediator.mediate(conflicts, plan).await?;
+
+        match resolution {
+            Resolution::SandboxInstall => {
+                // إعادة التخطيط مع sandbox
+                let sandbox_plan = plan.with_sandbox(SandboxLevel::Standard);
+                Box::pin(self.execute_install(sandbox_plan, creds)).await
+            }
+            Resolution::ForceReplace => {
+                // إزالة الحزم المتعارضة ثم المتابعة
+                self.remove_conflicting_packages(&resolution.packages_to_remove).await?;
+                Box::pin(self.execute_install(plan, creds)).await
+            }
+            Resolution::Cancelled => Ok(TransactionResult::Cancelled),
+        }
+    }
+}
+```
+
+#### **8.3 SPMD Main Loop مع Socket Activation**
+
+```rust
+// src/daemon/mod.rs
+
+pub async fn run_daemon() -> Result<()> {
+    // تهيئة المكونات
+    let permission_engine = PermissionEngine::new(load_policy()?);
+    let store = StoreManager::new()?;
+    let detector = PackageManagerDetector::new(event_tx)?;
+    let freezer = ProcessFreezer;
+    let transaction_mgr = TransactionManager::new(store.clone())?;
+    let conflict_mediator = ConflictMediator::new(detector, freezer, store.clone())?;
+
+    // Spawn detector task
+    tokio::spawn(async move {
+        detector.run().await.unwrap();
+    });
+
+    // Spawn event handler
+    let mediator = conflict_mediator.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                DetectionEvent::ForeignInstallStarted { manager, package, process_id } => {
+                    // مجرد تسجيل - التعامل عند محاولة SPM تثبيت نفس الحزمة
+                    tracing::info!("Foreign install detected: {} by {:?} (PID: {})", package, manager, process_id);
+                }
+                DetectionEvent::SpmFileTouched { path, foreign_manager, process_id } => {
+                    // تجميد ووساطة فورية
+                    if let Err(e) = mediator.handle_foreign_touch_spm_file(&path, foreign_manager, process_id).await {
+                        tracing::error!("Failed to mediate foreign touch: {}", e);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Socket Activation
+    let listener = if let Some(std_listener) = try_systemd_socket_activation()? {
+        tokio::net::UnixListener::from_std(std_listener)?
+    } else {
+        let sock_path = "/run/spm.sock";
+        let _ = fs::remove_file(sock_path);
+        let l = tokio::net::UnixListener::bind(sock_path)?;
+        fs::set_permissions(sock_path, fs::Permissions::from_mode(0o660))?;
+        l
+    };
+
+    tracing::info!("spmd listening on /run/spm.sock");
+
+    // Main accept loop
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let creds = get_peer_creds(&stream)?;
+
+        let permission_engine = permission_engine.clone();
+        let transaction_mgr = transaction_mgr.clone();
+
+        tokio::spawn(async move {
+            handle_connection(stream, creds, permission_engine, transaction_mgr).await;
+        });
+    }
+}
+```
+
+---
+
+### **🎨 المرحلة 9: UX Quality - واجهة مستخدم ممتازة (أسبوع 7)**
+
+#### **7.1 Progress Bars جميلة (indicatif)**
+
+```rust
+// src/ux/progress.rs
+
+pub struct SpmProgress {
+    multi: MultiProgress,
+    style: ProgressStyle,
+}
+
+impl SpmProgress {
+    pub fn new() -> Self {
+        let style = ProgressStyle::default_bar()
+            .template("{spinner:.green} {wide_msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .progress_chars("█▉▊▋▌▍▎▏  ");
+
+        Self {
+            multi: MultiProgress::new(),
+            style,
+        }
+    }
+
+    pub fn download(&self, name: &str, total: u64) -> ProgressBar {
+        let pb = self.multi.add(ProgressBar::new(total));
+        pb.set_style(self.style.clone());
+        pb.set_message(format!("Downloading {}", name));
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb
+    }
+
+    pub fn extract(&self, name: &str, total: u64) -> ProgressBar {
+        let pb = self.multi.add(ProgressBar::new(total));
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.yellow} Extracting {wide_msg} [{bar:40.green/white}] {pos}/{len}")
+            .progress_chars("█▉▊▋▌▍▎▏  "));
+        pb.set_message(name.to_string());
+        pb
+    }
+
+    pub fn install(&self, name: &str, steps: u64) -> ProgressBar {
+        let pb = self.multi.add(ProgressBar::new(steps));
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} Installing {wide_msg} [{bar:40.cyan/blue}] {pos}/{len}")
+            .progress_chars("█▉▊▋▌▍▎▏  "));
+        pb.set_message(name.to_string());
+        pb
+    }
+}
+```
+
+#### **7.2 Interactive Prompts (dialoguer)**
+
+```rust
+// src/ux/prompts.rs
+
+pub struct SpmPrompts;
+
+impl SpmPrompts {
+    pub fn confirm_install(packages: &[PackageInfo]) -> Result<bool> {
+        let mut theme = ColorfulTheme::default();
+        theme.prompt_suffix = " ";
+
+        println!("\n{}", style("سيتم تثبيت الحزم التالية:").bold());
+        for pkg in packages {
+            println!("  {} {} ({})", style("•").green(), style(&pkg.name).bold(), style(&pkg.version).dim());
+        }
+        println!();
+
+        Confirm::with_theme(&theme)
+            .with_prompt("المتابعة؟")
+            .default(true)
+            .interact()
+    }
+
+    pub fn select_conflict_resolution(
+        pkg_name: &str,
+        foreign_mgr: PackageManager,
+        options: &[ResolutionOption]
+    ) -> Result<usize> {
+        let mut theme = ColorfulTheme::default();
+
+        println!("\n{}", style(format!("⚠ تعارض: {} مثبتة عبر {:?}", pkg_name, foreign_mgr)).yellow().bold());
+        println!("{}", style("كيف تريد المتابعة؟").bold());
+
+        let items: Vec<String> = options.iter().map(|o| {
+            let risk_color = match o.risk {
+                RiskLevel::None => style("●").green(),
+                RiskLevel::Low => style("●").yellow(),
+                RiskLevel::Medium => style("●").yellow(),
+                RiskLevel::High => style("●").red(),
+            };
+            format!("{} {}  {}", risk_color, style(&o.description).bold(), style(&o.command).dim().cyan())
+        }).collect();
+
+        Select::with_theme(&theme)
+            .with_prompt("اختر خياراً")
+            .items(&items)
+            .default(0)
+            .interact()
+    }
+
+    pub fn select_foreign_touch_action(
+        path: &Path,
+        spm_pkg: &str,
+        foreign_mgr: PackageManager,
+        pid: u32
+    ) -> Result<ForeignTouchAction> {
+        let mut theme = ColorfulTheme::default();
+
+        println!("\n{}", style("⚠ محاولة تعديل ملفات SPM").red().bold());
+        println!("  الملف: {}", style(path.display()).cyan());
+        println!("  الحزمة: {}", style(spm_pkg).green());
+        println!("  العملية: {:?} (PID: {})", foreign_mgr, pid);
+
+        let options = vec![
+            "السماح بالتعديل (إزالة حماية SPM)",
+            "رفض التعديل (قتل العملية)",
+            "تثبيت في Sandbox بدلاً من ذلك",
+        ];
+
+        let selection = Select::with_theme(&theme)
+            .with_prompt("الإجراء")
+            .items(&options)
+            .default(1)  // افتراضي: رفض
+            .interact()?;
+
+        Ok(match selection {
+            0 => ForeignTouchAction::Allow,
+            1 => ForeignTouchAction::DenyAndKill,
+            2 => ForeignTouchAction::SandboxInstall,
+            _ => ForeignTouchAction::DenyAndKill,
+        })
+    }
+}
+```
+
+#### **7.3 Smart Output Formatting**
+
+```rust
+// src/ux/formatter.rs
+
+pub struct SpmFormatter;
+
+impl SpmFormatter {
+    pub fn print_install_summary(result: &InstallResult) {
+        println!("\n{}", style("═══════════════════════════════").dim());
+        println!("{} {}", style("✔").green().bold(), style("التثبيت مكتمل").bold());
+        println!("{}", style("═══════════════════════════════").dim());
+
+        for pkg in &result.packages {
+            println!("\n  {} {} {}",
+                style("📦").blue(),
+                style(&pkg.name).bold(),
+                style(format!("v{}", pkg.version)).dim()
+            );
+            println!("     {} {}", style("المصدر:").dim(), pkg.source);
+            println!("     {} {}", style("الحجم:").dim(), fmt_size(pkg.size));
+            println!("     {} {}", style("الملفات:").dim(), pkg.file_count);
+            if pkg.sandboxed {
+                println!("     {} {}", style("🔒").yellow(), style("معزول في Sandbox").yellow());
+            }
+        }
+
+        println!("\n  {} {} في {}",
+            style("📊").blue(),
+            style(format!("{} حزمة", result.packages.len())).bold(),
+            style(fmt_duration(result.duration)).dim()
+        );
+        println!("  {} {}", style("💾").blue(), style(fmt_size(result.total_size)).dim());
+    }
+
+    pub fn print_error_actionable(error: &SpmError) {
+        eprintln!("\n{} {}", style("✖").red().bold(), style("خطأ").red().bold());
+        eprintln!("{}", style("──────────────────").dim());
+        eprintln!("  {}", error);
+        eprintln!("{}", style("──────────────────").dim());
+
+        // اقتراحات قابلة للتنفيذ
+        match error {
+            SpmError::PackageNotFound(pkg) => {
+                eprintln!("\n  {} {}", style("💡").yellow(), style("اقتراحات:").bold());
+                eprintln!("    • {}", style("spm update").cyan());
+                eprintln!("    • {}", style(format!("spm global-search {}", pkg)).cyan());
+                eprintln!("    • {}", style("spm repo list").cyan());
+            }
+            SpmError::Conflict { packages } => {
+                eprintln!("\n  {} {}", style("💡").yellow(), style("خيارات:").bold());
+                eprintln!("    • {}", style(format!("spm install --sandbox {}", packages[0])).cyan());
+                eprintln!("    • {}", style(format!("spm install --replace {}", packages[0])).cyan());
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+---
+
+### **⚙️ المرحلة 8: التكامل والاختبار (أسبوع 8)**
+
+#### **8.1 Systemd Service محسن**
+
+```ini
+# data/spmd.service (محدث)
+
+[Unit]
+Description=SPM Daemon — privileged package operations
+Documentation=man:spmd(8)
+After=network.target local-fs.target
+Requires=spm-init.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/spmd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+
+# Security Hardening
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=no
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Capabilities mínima
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_FOWNER
+
+# Read/Write paths
+ReadWritePaths=/var/lib/spm /var/cache/spm /etc/spm /run/spm
+
+# Resource Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### **8.2 Socket Unit**
+
+```ini
+# data/spmd.socket
+
+[Unit]
+Description=SPM Daemon Socket
+Documentation=man:spmd(8)
+
+[Socket]
+ListenStream=/run/spm.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=spm
+
+[Install]
+WantedBy=sockets.target
+```
+
+#### **8.3 Integration Tests**
+
+```rust
+// tests/integration.rs
+
+#[tokio::test]
+async fn test_cross_distro_install_deb_on_rpm() {
+    let env = TestEnv::new().await;
+
+    // تثبيت حزمة Debian على نظام RPM
+    let result = env.spm().args(["install", "--smart", "nginx"]).assert().success();
+
+    // التحقق من وجود الملفات في store مع origin deb
+    assert!(env.store_path("deb").join("nginx").exists());
+
+    // التحقق من RPATH للمكتبات
+    let nginx_bin = env.fhs_path("usr/sbin/nginx");
+    let rpath = read_rpath(&nginx_bin);
+    assert!(rpath.contains("/var/lib/spm/store/deb/"));
+    assert!(rpath.contains("/var/lib/spm/store/shared/libs/"));
+}
+
+#[tokio::test]
+async fn test_soname_deduplication() {
+    let env = TestEnv::new().await;
+
+    // تثبيت libssl3 (deb) و openssl-libs (rpm) - كلاهما يوفر libssl.so.3
+    env.spm().args(["install", "libssl3"]).assert().success();
+    env.spm().args(["install", "openssl-libs"]).assert().success();  // RPM name
+
+    // التحقق من وجود نسخة واحدة فيزيائية
+    let shared_lib = env.store_path("shared/libs/libssl.so.3");
+    assert!(shared_lib.exists());
+
+    // التحقق من hardlinks
+    let deb_lib = env.store_path("deb/.../usr/lib/x86_64-linux-gnu/libssl.so.3");
+    let rpm_lib = env.store_path("rpm/.../usr/lib64/libssl.so.3");
+
+    assert!(same_inode(&deb_lib, &shared_lib));
+    assert!(same_inode(&rpm_lib, &shared_lib));
+}
+
+#[tokio::test]
+async fn test_foreign_package_detection() {
+    let env = TestEnv::new().await;
+
+    // تثبيت nginx عبر SPM
+    env.spm().args(["install", "nginx"]).assert().success();
+
+    // محاولة تثبيت عبر apt (محاكاة)
+    let apt_pid = env.simulate_apt_install("nginx").await;
+
+    // SPM يجب أن يكتشف ويجمد العملية
+    let frozen = env.wait_for_freeze(apt_pid).await;
+    assert!(frozen);
+
+    // التحقق من ظهور prompt للمستخدم
+    let output = env.capture_output().await;
+    assert!(output.contains("محاولة تعديل ملفات SPM"));
+}
+
+#[tokio::test]
+async fn test_sandbox_isolation() {
+    let env = TestEnv::new().await;
+
+    // تثبيت حزمة قديمة تحتاج libssl1.1 في sandbox
+    env.spm().args(["install", "--sandbox=strict", "old-app"]).assert().success();
+
+    // تشغيل التطبيق في sandbox
+    let output = env.spm().args(["sandbox", "run", "old-app", "ldd", "/usr/bin/old-app"]).assert().success();
+
+    // التحقق من عزل الشبكة
+    let net_output = env.spm().args(["sandbox", "run", "old-app", "ping", "-c1", "8.8.8.8"]).assert().failure();
+    assert!(net_output.stderr().contains("Network is unreachable"));
+
+    // التحقق من PID namespace (التطبيق يرى PID 1)
+    let pid_output = env.spm().args(["sandbox", "run", "old-app", "ps", "aux"]).assert().success();
+    assert!(pid_output.stdout().contains("PID 1"));
+}
+
+#[tokio::test]
+async fn test_dependency_resolver_cycles() {
+    let env = TestEnv::new().await;
+
+    // حزمة A تعتمد على B، B تعتمد على A
+    env.create_test_repo_with_cycle("pkg-a", "pkg-b").await;
+
+    let result = env.spm().args(["install", "pkg-a"]).assert().failure();
+    assert!(result.stderr().contains("دورة تبعيات مكتشفة"));
+    assert!(result.stderr().contains("pkg-a ↔ pkg-b"));
+}
+
+#[tokio::test]
+async fn test_resumable_download() {
+    let env = TestEnv::new().await;
+
+    // بدء تحميل كبير
+    let handle = env.spm().args(["install", "large-package"]).spawn().await;
+
+    // قطع الاتصال بعد 10MB
+    sleep(Duration::from_secs(2)).await;
+    handle.kill().await;
+
+    // استئناف التحميل
+    let result = env.spm().args(["install", "large-package"]).assert().success();
+
+    // التحقق من عدم إعادة تحميل ما تم تحميله
+    assert!(result.stdout().contains("Resuming from"));
+}
+```
+
+---
+
+### **📋 قائمة المهام النهائية (TODO Master)**
+
+| # | المهمة | الملفات | الأولوية | التقدير |
+|---|---------|---------|----------|---------|
+| 1 | تحديث Cargo.toml بالمكتبات الجديدة | `Cargo.toml` | P0 | 1 يوم |
+| 2 | إنشاء هيكلية الموديلات الجديدة | `src/` | P0 | 2 يوم |
+| 3 | Store Manager + Deduplication | `src/store/` | P0 | 3 يوم |
+| 4 | Debian Fetcher (Pure Rust) | `src/package/fetch/debian.rs` | P0 | 3 يوم |
+| 5 | RPM Fetcher (Pure Rust) | `src/package/fetch/rpm.rs` | P0 | 3 يوم |
+| 6 | Extractor implementations | `src/package/extract/` | P0 | 2 يوم |
+| 7 | Signature/Hash Verification | `src/package/fetch/verify.rs` | P0 | 2 يوم |
+| 8 | Dependency Resolver كامل | `src/package/resolver/` | P0 | 4 يوم |
+| 9 | Sandbox Engine (Namespaces, Seccomp, Landlock, Cgroups) | `src/package/sandbox/` | P1 | 4 يوم |
+| 10 | Coexistence Detector (inotify) | `src/isolation/detector.rs` | P1 | 2 يوم |
+| 11 | Process Freezer | `src/isolation/freezer.rs` | P1 | 1 يوم |
+| 12 | Conflict Mediator (Zypper-like) | `src/package/install/conflict.rs` | P1 | 3 يوم |
+| 13 | SPMD Rewrite (Permission Engine, Transaction Manager) | `src/daemon/` | P1 | 4 يوم |
+| 14 | UX Components (Progress, Prompts, Formatter) | `src/ux/` | P2 | 3 يوم |
+| 15 | Systemd Service Hardening | `data/spmd.service` | P2 | 1 يوم |
+| 16 | Integration Tests | `tests/integration.rs` | P2 | 3 يوم |
+| 17 | Shell Completions | `src/ux/completions.rs` | P3 | 1 يوم |
+| 18 | Documentation & Man Pages | `docs/` | P3 | 2 يوم |
+
+**المجموع التقديري: ~8 أسابيع (فريق من 2-3 مطورين)**
+
+---
+
+### **🔑 القرارات التقنية الحاسمة (للمراجعة)**
+
+| القرار | الخيار المختار | البدائل المرفوضة |
+|---------|---------------|------------------|
+| HTTP Client | `reqwest` + `rustls` | `ureq` (blocking), `hyper` (low-level) |
+| Debian Parsing | `deb822` crate | manual parsing |
+| RPM Parsing | `rpm-rs` + `cpio` | `rpm2cpio` subprocess |
+| XML Parsing | `quick-xml` | `roxmltree`, manual |
+| Signature Verification | `sequoia-openpgp` | `openpgp`, `gpgme` |
+| Sandbox | Linux Namespaces + Seccomp + Landlock | `bubblewrap`, `firejail`, `chroot` |
+| File Monitoring | `notify` (inotify) | `inotify-rs`, `fanotify` |
+| Progress Bars | `indicatif` | `tqdm`, `console` |
+| Prompts | `dialoguer` | `inquire`, `clap` interactive |
+| Dependency Cache | `sled` | `sqlite`, `redis`, in-memory |
+| IPC Protocol | JSON over Unix Socket | `protobuf`, `capnp`, `dbus` |
+
+---
+
+### **🧹 إزالة الاعتماد على الأدوات الخارجية — خطة كاملة**
+
+#### **المبدأ الأساسي: SPM هو المسيطر الوحيد — لا يسأل أحداً عن الإذن**
+`metadata.db` هو المصدر الوحيد للحقيقة. لا حاجة لقراءة قواعد بيانات dpkg/rpm. SPM لا يتبع أحداً.
+
+#### **1. apt-get / dnf ← HTTP مباشر + بارسير نقي**
+
+لا `apt-get download` ولا `dnf download`. المستودعات مجرد HTTP:
+
+- **Debian**: `http://mirror/dists/noble/InRelease` → `Packages.gz` (deb822) → `.deb`
+  - `reqwest` لتحميل الملفات (موجود)
+  - Parser deb822: key: value format — سطرين:
+    ```rust
+    for entry in content.split("\n\n") {
+        for line in entry.lines() { /* Package:, Version:, Filename: */ }
+    }
+    ```
+  - `flate2` / `xz2` لفك الضغط (موجودان)
+  - `sequoia-openpgp` للتحقق من InRelease signatures إن لزم
+
+- **Fedora**: `http://mirror/repodata/repomd.xml` → `primary.xml.gz` → `.rpm`
+  - `quick-xml` لـ XML (موجود)
+  - نفس منطق HTTP + parse
+
+#### **2. dpkg / rpm ← لا حاجة لهما أصلاً**
+
+SPM لا يسأل dpkg/rpm عن شيء. `metadata.db` عنده كل الحقيقة.
+- `spm init --from-system` يحتاجهم **مرة وحدة في العمر**. حتى هذا ممكن نبدأ بقاعدة بيانات فارغة ونسأل المستخدم فقط.
+- لقراءة `/var/lib/dpkg/status` في تلك المرة: بارسير deb822 بسيط (نفس format Packages.gz).
+- لقراءة RPM DB: `/var/lib/rpm/Packages` هو SQLite في Fedora 33+ — `rusqlite` موجود.
+
+#### **3. systemctl ← pidfile + signals**
+
+`spmd` يكتب PID في `/run/spmd.pid`:
+```rust
+fs::write("/run/spmd.pid", format!("{}", std::process::id()))?;
+```
+CLI يقرأ الـ PID ويرسل إشارة:
+```rust
+let pid = fs::read_to_string("/run/spmd.pid")?.parse::<nix::unistd::Pid>()?;
+nix::sys::signal::kill(pid, nix::sys::signal::SIGTERM)?;  // إيقاف
+nix::sys::signal::kill(pid, nix::sys::signal::SIGHUP)?;   // إعادة تحميل
+```
+
+لا `systemctl start`, لا `systemctl stop`, لا `systemctl daemon-reload`.
+لـ socket activation: `sd-notify` crate كبديل خفيف.
+
+#### **4. dkms / dracut / update-initramfs / grub-* ← ليست من مسؤولية Package Manager**
+
+هذه hooks اختيارية في maintainer scripts، **ليست** أساسية لـ package manager:
+- **dkms**: `postinst` يستدعي `make` على مصدر الوحدة.
+- **dracut/update-initramfs**: `postinst` يبني initramfs — هذا عمل distro/kernel package.
+- **grub-***: `postinst` يحدث bootloader — هذا عمل distro package.
+- SPM ينفذ `postinst` فقط، ولا يتحمل مسؤولية بناء kernel/bootloader.
+
+#### **5. lspci / lsmod ← /proc و /sys مباشرة**
+
+- **lsmod**: `/proc/modules` — ملف نصي سطرين:
+  ```rust
+  for line in fs::read_to_string("/proc/modules")?.lines() {
+      let name = line.split_whitespace().next();
+  }
+  ```
+- **lspci**: `/sys/bus/pci/devices/` — مجلدات + `vendor`, `device` files:
+  ```rust
+  for entry in fs::read_dir("/sys/bus/pci/devices/")? {
+      let vendor = fs::read_to_string(entry?.path().join("vendor"))?;
+  }
+  ```
+
+#### **6. gpg ← Ed25519 موجود + sequoia-openpgp للـ PGP**
+
+- التوقيع والتحقق: `ed25519-dalek` + `pkcs8` + `pem` (موجود في Cargo.toml)
+- للتوافق مع PGP (InRelease, .asc files): **`sequoia-openpgp`** — Pure Rust، ناضج، سريع
+
+#### **خلاصة النهج: لا تابع، بل متبوع**
+
+SPM لا يقرأ من dpkg/rpm، لا يستخدم apt-get/dnf، لا يستدعي systemctl.
+SPM يتحكم في كل شيء مباشرة عبر:
+- `reqwest` + parsers للمستودعات
+- `ed25519-dalek` / `sequoia-openpgp` للتوقيع
+- procfs/sysfs للمعلومات
+- pidfile + signals للـ daemon
+- SQLite كقاعدة بيانات وحيدة
+
+
+
+### **📝 ملاحظات للمطورين**
+
+1. **ابدأ بـ Store Manager** - هو الأساس الذي يعتمد عليه كل شيء
+2. **Resolver هو الأعقد** - خصص وقتاً كافياً للـ PubGrub integration
+3. **Sandbox يحتاج صلاحيات Root** - اختبر في CI مع `--privileged`
+4. **inotify له حدود** - راقب `fs.inotify.max_user_watches`
+5. **Seccomp profiles** - ابدأ بـ allowlist واسع ثم ضيقه تدريجياً
+6. **SPMD يجب أن يكون single binary** - لا dependencies runtime
+7. **لا توجد تبعيات خارجية** - كل أداة نظام إما مستبدلة بـ Rust أو غير مطلوبة
+8. **المبدأ الذهبي: SPM لا يسأل أحداً عن الإذن** - كل الملفات إما HTTP + parse أو procfs/sysfs
+7- يجب عليك الالتزام بصرامة بالطلبات
+8- يجب عليك ان تكتب الكود بطريقة rust النظيفة والامنة
+---
+
