@@ -1,11 +1,10 @@
 use chrono::Utc;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
-
 use crate::config::{paths, repos};
 use crate::db;
 use crate::error::{SpmError, SpmResult};
+use crate::integration;
 use crate::types::*;
 
 pub fn match_native_packages(query: &str, index: &RepoIndex) -> Vec<Package> {
@@ -27,54 +26,135 @@ pub fn match_native_packages(query: &str, index: &RepoIndex) -> Vec<Package> {
     results
 }
 
+/// Search cached Packages files for a matching package name.
+fn search_deb_cache(repo_name: &str, query: &str) -> Vec<Package> {
+    let mut results = Vec::new();
+    let q = query.to_lowercase();
+    let deb_cache = crate::config::paths::repos_cache_dir().join("deb").join(repo_name);
+    if !deb_cache.exists() {
+        return results;
+    }
+    if let Ok(entries) = fs::read_dir(&deb_cache) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name_str) = path.file_name().and_then(|s| s.to_str()) {
+                if name_str.starts_with("Packages-") {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        let mut current_name = String::new();
+                        let mut current_desc = String::new();
+                        for line in text.lines() {
+                            if line.is_empty() {
+                                if !current_name.is_empty() && current_name.to_lowercase().contains(&q) {
+                                    results.push(Package {
+                                        name: current_name.clone(),
+                                        version: String::new(),
+                                        format: PackageFormat::Deb,
+                                        source_repo: Some("apt".to_string()),
+                                        ..Default::default()
+                                    });
+                                }
+                                current_name.clear();
+                                current_desc.clear();
+                                continue;
+                            }
+                            if let Some(val) = line.strip_prefix("Package: ") {
+                                current_name = val.trim().to_string();
+                            } else if let Some(val) = line.strip_prefix("Description: ") {
+                                current_desc = val.trim().to_string();
+                            }
+                        }
+                        if !current_name.is_empty() && current_name.to_lowercase().contains(&q) {
+                            results.push(Package {
+                                name: current_name,
+                                version: String::new(),
+                                format: PackageFormat::Deb,
+                                source_repo: Some("apt".to_string()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+/// Search cached SONAME index for RPM packages matching query.
+fn search_rpm_cache(query: &str) -> Vec<Package> {
+    let q = query.to_lowercase();
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Ok(index) = crate::index::SonameIndex::load() {
+        for (_key, entry) in &index.entries {
+            // Package names are registered in the index as their own key
+            for provider in &entry.providers {
+                if provider.source == RepoSource::Rpm
+                    && !seen.contains(&provider.pkg)
+                    && provider.pkg.to_lowercase().contains(&q)
+                {
+                    seen.insert(provider.pkg.clone());
+                    results.push(Package {
+                        name: provider.pkg.clone(),
+                        version: provider.version.clone(),
+                        format: PackageFormat::Rpm,
+                        source_repo: Some("dnf".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    // Also search through cached repo index from spm update
+    if let Ok(content) = get_rpm_repo_index() {
+        if let Some(index) = content {
+            for record in &index.packages {
+                if record.name.to_lowercase().contains(&q) && !seen.contains(&record.name) {
+                    seen.insert(record.name.clone());
+                    results.push(Package {
+                        name: record.name.clone(),
+                        version: record.version.clone(),
+                        format: PackageFormat::Rpm,
+                        source_repo: Some("dnf".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    results
+}
+
+fn get_rpm_repo_index() -> SpmResult<Option<crate::types::RepoIndex>> {
+    let cache_dir = paths::repos_cache_dir().join("rpm");
+    if !cache_dir.exists() {
+        return Ok(None);
+    }
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let index_path = entry.path().join("repo-index.json");
+            if index_path.exists() {
+                if let Ok(content) = fs::read_to_string(&index_path) {
+                    if let Ok(index) = serde_json::from_str(&content) {
+                        return Ok(Some(index));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn search_packages(query: &str) -> SpmResult<Vec<Package>> {
     let mut results = Vec::new();
     let repos_list = repos::load_repos()?;
     for (_repo_name, repo_config) in &repos_list {
         match repo_config.source {
-            RepoSource::Apt => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("apt-cache"))
-                    .args(["search", query])
-                    .stderr(Stdio::null())
-                    .output()
-                {
-                    if output.status.success() {
-                        for line in String::from_utf8_lossy(&output.stdout).lines() {
-                            if let Some((name, _desc)) = line.split_once(" - ") {
-                                results.push(Package {
-                                    name: name.trim().to_string(),
-                                    version: String::new(),
-                                    format: PackageFormat::Deb,
-                                    source_repo: Some("apt".to_string()),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
+            RepoSource::Deb => {
+                results.extend(search_deb_cache(_repo_name, query));
             }
-            RepoSource::Dnf => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("dnf"))
-                    .args(["search", "--quiet", query])
-                    .stderr(Stdio::null())
-                    .output()
-                {
-                    if output.status.success() {
-                        for line in String::from_utf8_lossy(&output.stdout).lines() {
-                            if let Some((pkg, _desc)) = line.split_once(" : ") {
-                                if let Some(name) = pkg.rsplit_once('.').map(|(n, _a)| n).or(Some(pkg)) {
-                                    results.push(Package {
-                                        name: name.trim().to_string(),
-                                        version: String::new(),
-                                        format: PackageFormat::Rpm,
-                                        source_repo: Some("dnf".to_string()),
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+            RepoSource::Rpm => {
+                results.extend(search_rpm_cache(query));
             }
             RepoSource::Native => {
                 let repo_cache = paths::repos_cache_dir().join("native").join(_repo_name).join("repo-index.json");
@@ -101,25 +181,61 @@ pub fn package_info(name: &str) -> SpmResult<String> {
             pkg.name, pkg.version, pkg.format, pkg.install_type, pkg.install_date
         ));
     }
+    // Search cached repo data for package info
     let repos_list = repos::load_repos()?;
     for (_repo_name, repo_config) in &repos_list {
         match repo_config.source {
-            RepoSource::Apt => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("apt-cache")).args(["show", name]).stderr(Stdio::null()).output() {
-                    if output.status.success() {
-                        let out = String::from_utf8_lossy(&output.stdout);
-                        if !out.trim().is_empty() {
-                            return Ok(out.to_string());
+            RepoSource::Deb => {
+                let deb_cache = paths::repos_cache_dir().join("deb").join(_repo_name);
+                if deb_cache.exists() {
+                    if let Ok(entries) = fs::read_dir(&deb_cache) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                                if fname.starts_with("Packages-") {
+                                    if let Ok(text) = fs::read_to_string(&p) {
+                                        let mut in_pkg = false;
+                                        let mut entry_text = String::new();
+                                        for line in text.lines() {
+                                            if line.is_empty() {
+                                                if in_pkg {
+                                                    return Ok(entry_text);
+                                                }
+                                                entry_text.clear();
+                                                in_pkg = false;
+                                                continue;
+                                            }
+                                            if let Some(val) = line.strip_prefix("Package: ") {
+                                                if val.trim().eq_ignore_ascii_case(name) {
+                                                    in_pkg = true;
+                                                }
+                                            }
+                                            if in_pkg {
+                                                entry_text.push_str(line);
+                                                entry_text.push('\n');
+                                            }
+                                        }
+                                        if in_pkg && !entry_text.is_empty() {
+                                            return Ok(entry_text);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            RepoSource::Dnf => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("dnf")).args(["repoquery", "--info", name]).stderr(Stdio::null()).output() {
-                    if output.status.success() {
-                        let out = String::from_utf8_lossy(&output.stdout);
-                        if !out.trim().is_empty() {
-                            return Ok(out.to_string());
+            RepoSource::Rpm => {
+                // Look up in SONAME index or cached RPM repo data
+                if let Ok(index) = crate::index::SonameIndex::load() {
+                    if let Some(providers) = index.get_providers(name) {
+                        if let Some(provider) = providers.first() {
+                            if provider.source == RepoSource::Rpm {
+                                return Ok(format!(
+                                    "Package: {}\nVersion: {}\nRepository: {}\n",
+                                    provider.pkg, provider.version, provider.repo
+                                ));
+                            }
                         }
                     }
                 }
@@ -139,15 +255,22 @@ pub fn list_package_files(name: &str) -> SpmResult<Vec<String>> {
     if !files.is_empty() {
         return Ok(files.into_iter().map(|f| f.filepath).collect());
     }
-    let output = Command::new(crate::util::backend::resolve("dpkg")).args(["-L", name]).output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run dpkg: {e}")))?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect());
+    // Fallback: read native DB files
+    if let Ok(content) = std::fs::read_to_string(format!("/var/lib/dpkg/info/{name}.list")) {
+        return Ok(content.lines().map(|s| s.to_string()).filter(|l| !l.is_empty()).collect());
     }
-    let output = Command::new(crate::util::backend::resolve("rpm")).args(["-ql", name]).output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run rpm: {e}")))?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect());
+    // Try RPM sqlite DB
+    if let Ok(conn) = rusqlite::Connection::open("/var/lib/rpm/rpmdb.sqlite") {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT fi.name FROM files fi JOIN packages p ON p.packageId = fi.packageId WHERE p.name = ?1"
+        ) {
+            if let Ok(rows) = stmt.query_map([name], |row| row.get::<_, String>(0)) {
+                let files: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                if !files.is_empty() {
+                    return Ok(files);
+                }
+            }
+        }
     }
     Ok(Vec::new())
 }
@@ -165,50 +288,24 @@ pub fn package_dependencies(name: &str) -> SpmResult<Vec<Dependency>> {
             }
         }
     }
-    // Fallback: query native backends
-    let repos_list = repos::load_repos()?;
-    for (_repo_name, repo_config) in &repos_list {
-        match repo_config.source {
-            RepoSource::Apt => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("apt-cache")).args(["depends", name]).stderr(Stdio::null()).output() {
-                    if output.status.success() {
-                        return Ok(String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .filter(|l| l.contains("Depends:"))
-                            .filter_map(|l| l.split(':').nth(1).map(|s| Dependency {
-                                name: s.trim().to_string(),
-                                version: String::new(),
-                                source: DependencySource::System,
-                                format: Some(PackageFormat::Deb),
-                            }))
-                            .collect());
-                    }
-                }
+    // Fallback: read from SONAME index / cached repo data
+    if let Ok(index) = crate::index::SonameIndex::load() {
+        if let Some(requires) = index.get_requires(name) {
+            if !requires.is_empty() {
+                return Ok(requires.iter().map(|r| Dependency {
+                    name: r.to_string(),
+                    version: String::new(),
+                    source: DependencySource::System,
+                    format: None,
+                }).collect());
             }
-            RepoSource::Dnf => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("dnf")).args(["repoquery", "--requires", name]).stderr(Stdio::null()).output() {
-                    if output.status.success() {
-                        return Ok(String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .filter(|l| !l.is_empty())
-                            .map(|l| Dependency {
-                                name: l.trim().to_string(),
-                                version: String::new(),
-                                source: DependencySource::System,
-                                format: Some(PackageFormat::Rpm),
-                            })
-                            .collect());
-                    }
-                }
-            }
-            _ => {}
         }
     }
     Ok(Vec::new())
 }
 
 pub fn reverse_dependencies(name: &str) -> SpmResult<Vec<String>> {
-    // First try SPM DB: scan all installed packages' manifests for reverse deps
+    // Scan SPM DB: from installed packages' manifests
     let mut results: Vec<String> = Vec::new();
     if let Ok(conn) = db::get_connection() {
         if let Ok(packages) = db::list_installed_packages(&conn) {
@@ -230,40 +327,12 @@ pub fn reverse_dependencies(name: &str) -> SpmResult<Vec<String>> {
         results.dedup();
         return Ok(results);
     }
-    // Fallback: query native backends
-    let repos_list = repos::load_repos()?;
-    for (_repo_name, repo_config) in &repos_list {
-        match repo_config.source {
-            RepoSource::Apt => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("apt-cache"))
-                    .args(["--installed", "--recurse", "rdepends", name]).output()
-                {
-                    if output.status.success() {
-                        return Ok(String::from_utf8_lossy(&output.stdout)
-                            .lines().skip(1).map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()).collect());
-                    }
-                }
-            }
-            RepoSource::Dnf => {
-                if let Ok(output) = Command::new(crate::util::backend::resolve("dnf")).args(["repoquery", "--whatrequires", name]).output() {
-                    if output.status.success() {
-                        return Ok(String::from_utf8_lossy(&output.stdout)
-                            .lines().map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()).collect());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
     Ok(Vec::new())
 }
 
 /// Find which installed package owns a given file path.
-/// Queries the SPM DB first, then falls back to dpkg / rpm.
+/// Queries the SPM DB first.
 pub fn search_file_owner(path: &str) -> SpmResult<Vec<String>> {
-    // Canonicalize the path
     let resolved = Path::new(path);
     let path_str = resolved.to_string_lossy().to_string();
 
@@ -274,7 +343,6 @@ pub fn search_file_owner(path: &str) -> SpmResult<Vec<String>> {
                 return Ok(files);
             }
         }
-        // Also try with resolved canonical path
         if let Ok(canon) = resolved.canonicalize() {
             let canon_str = canon.to_string_lossy().to_string();
             if canon_str != path_str {
@@ -287,37 +355,38 @@ pub fn search_file_owner(path: &str) -> SpmResult<Vec<String>> {
         }
     }
 
-    // 2. Try dpkg -S
-    let output = Command::new(crate::util::backend::resolve("dpkg"))
-        .args(["-S", path])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(o) = output {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let pkgs: Vec<String> = stdout.lines()
-                .filter_map(|l| l.split(':').next().map(|s| s.trim().to_string()))
-                .collect();
-            if !pkgs.is_empty() {
-                return Ok(pkgs);
+    // 2. Try native DB files as fallback
+    if let Ok(content) = std::fs::read_to_string(format!("/var/lib/dpkg/info/{path}.list")) {
+        return Ok(vec![content]);
+    }
+    // Scan dpkg info directory for matching list files
+    if let Ok(entries) = std::fs::read_dir("/var/lib/dpkg/info") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("list") {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    if content.lines().any(|l| l.trim() == path_str) {
+                        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                            return Ok(vec![stem]);
+                        }
+                    }
+                }
             }
         }
     }
 
-    // 3. Try rpm -qf
-    let output = Command::new(crate::util::backend::resolve("rpm"))
-        .args(["-qf", "--queryformat", "%{NAME}\n", path])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(o) = output {
-        if o.status.success() {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let pkgs: Vec<String> = stdout.lines()
-                .filter(|l| !l.is_empty())
-                .map(|s| s.trim().to_string())
-                .collect();
-            if !pkgs.is_empty() {
-                return Ok(pkgs);
+    // 3. Try RPM sqlite DB
+    if let Ok(conn) = rusqlite::Connection::open("/var/lib/rpm/rpmdb.sqlite") {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT p.name FROM packages p \
+             JOIN files fi ON fi.packageId = p.packageId \
+             WHERE fi.name = ?1 LIMIT 10"
+        ) {
+            if let Ok(rows) = stmt.query_map([path_str], |row| row.get::<_, String>(0)) {
+                let pkgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                if !pkgs.is_empty() {
+                    return Ok(pkgs);
+                }
             }
         }
     }
@@ -388,46 +457,24 @@ pub fn show_history() -> SpmResult<String> {
 }
 
 pub fn create_snapshot() -> SpmResult<()> {
-    if !Path::new("/sbin/btrfs").exists() && !Path::new("/usr/sbin/btrfs").exists() {
+    if !integration::fs::is_btrfs_subvolume(Path::new("/"))? {
         return Err(SpmError::other("Btrfs not available on this system"));
     }
     let timestamp = Utc::now().format("%Y-%m-%d_%H%M%S");
     let snap_dir = "/.spm-snapshots";
     fs::create_dir_all(snap_dir)?;
-    let snap_name = format!("{}/root-{}", snap_dir, timestamp);
-    let output = Command::new("btrfs")
-        .args(["subvolume", "snapshot", "-r", "/", &snap_name])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to create Btrfs snapshot: {e}")))?;
-    if output.status.success() {
-        println!("Btrfs snapshot created: {}", snap_name);
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("Invalid argument") || stderr.contains("not supported") {
-            return Err(SpmError::other(
-                "Btrfs snapshots not supported on this filesystem. Is / mounted with btrfs?"
-            ));
-        }
-        return Err(SpmError::command_failed(format!("Failed to create Btrfs snapshot: {stderr}")));
-    }
+    let snap_name = format!("root-{}", timestamp);
+    integration::fs::create_btrfs_snapshot(Path::new("/"), Path::new(snap_dir), &snap_name)?;
+    println!("Btrfs snapshot created: {}/{}", snap_dir, snap_name);
     Ok(())
 }
 
 pub fn rollback_snapshot(id: &str) -> SpmResult<()> {
-    if !Path::new("/sbin/btrfs").exists() && !Path::new("/usr/sbin/btrfs").exists() {
+    if !integration::fs::is_btrfs_subvolume(Path::new("/"))? {
         return Err(SpmError::other("Btrfs not available on this system"));
     }
-    let output = Command::new("btrfs")
-        .args(["subvolume", "snapshot", id, "/"])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to rollback Btrfs snapshot: {e}")))?;
-    if output.status.success() {
-        println!("Rolled back to snapshot {}", id);
-    } else {
-        return Err(SpmError::command_failed(format!(
-            "Failed to rollback snapshot: {}", String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    integration::fs::rollback_btrfs_snapshot(Path::new(id), Path::new("/"))?;
+    println!("Rolled back to snapshot {}", id);
     Ok(())
 }
 

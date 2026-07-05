@@ -14,6 +14,8 @@ pub fn load_repos() -> SpmResult<Vec<(String, RepoConfig)>> {
     let repos_dir = paths::repos_config_dir();
     let mut repos = Vec::new();
 
+    tracing::debug!("load_repos: repos_dir={:?} exists={}", repos_dir, repos_dir.exists());
+
     if !repos_dir.exists() {
         return Ok(repos);
     }
@@ -90,8 +92,8 @@ pub fn create_repo(
 
     match source {
         RepoSource::Native => create_native_repo(name, &base_path),
-        RepoSource::Apt => create_apt_repo(name, &base_path, codename, component, mirror),
-        RepoSource::Dnf => create_dnf_repo(name, &base_path),
+        RepoSource::Deb => create_deb_repo(name, &base_path, codename, component, mirror),
+        RepoSource::Rpm => create_rpm_repo(name, &base_path),
     }
 }
 
@@ -123,7 +125,7 @@ fn create_native_repo(name: &str, base_path: &std::path::Path) -> SpmResult<()> 
     Ok(())
 }
 
-fn create_apt_repo(
+fn create_deb_repo(
     name: &str,
     base_path: &std::path::Path,
     codename: Option<&str>,
@@ -174,7 +176,7 @@ fn create_apt_repo(
             .map_err(|e| SpmError::config(format!("Cannot write {:?}: {e}", release_path)))?;
     }
 
-    crate::output::step_success(format!("Initialised apt repo at {:?}", base_path));
+    crate::output::step_success(format!("Initialised deb repo at {:?}", base_path));
     crate::output::step_info("Structure: pool/ → .deb files, dists/ → metadata");
 
     // Auto-add as a configured repository
@@ -182,14 +184,14 @@ fn create_apt_repo(
     if !repos.iter().any(|(n, _)| n == name) {
         let repo_url = format!("file://{}", base_path.to_string_lossy());
         let mirrors = mirror.map(|m| vec![m.to_string()]);
-        add_repo(name, RepoSource::Apt, Some(repo_url), mirrors, None)?;
+        add_repo(name, RepoSource::Deb, Some(repo_url), mirrors, None)?;
         crate::output::step_success(format!("Added '{}' to repository list", name));
     }
 
     Ok(())
 }
 
-fn create_dnf_repo(name: &str, base_path: &std::path::Path) -> SpmResult<()> {
+fn create_rpm_repo(name: &str, base_path: &std::path::Path) -> SpmResult<()> {
     // Packages/ — where .rpm files go
     let packages_dir = base_path.join("Packages");
     fs::create_dir_all(&packages_dir)
@@ -242,14 +244,14 @@ fn create_dnf_repo(name: &str, base_path: &std::path::Path) -> SpmResult<()> {
             .map_err(|e| SpmError::config(format!("Cannot write {:?}: {e}", filelists_path)))?;
     }
 
-    crate::output::step_success(format!("Initialised dnf repo at {:?}", base_path));
+    crate::output::step_success(format!("Initialised rpm repo at {:?}", base_path));
     crate::output::step_info("Structure: Packages/ → .rpm files, repodata/ → metadata");
 
     // Auto-add as a configured repository
     let repos = load_repos()?;
     if !repos.iter().any(|(n, _)| n == name) {
         let repo_url = format!("file://{}", base_path.to_string_lossy());
-        add_repo(name, RepoSource::Dnf, Some(repo_url.clone()), None, None)?;
+        add_repo(name, RepoSource::Rpm, Some(repo_url.clone()), None, None)?;
         crate::output::step_success(format!("Added '{}' to repository list (url={})", name, repo_url));
     }
 
@@ -285,8 +287,8 @@ pub fn publish_package(name: &str, package_path: &str) -> SpmResult<()> {
 
     match config.source {
         RepoSource::Native => publish_to_native(base, &manifest, &filename, &hash, &sam_bytes),
-        RepoSource::Apt => publish_to_apt(base, config, &manifest, &filename, &hash, &sam_bytes),
-        RepoSource::Dnf => publish_to_dnf(base, &manifest, &filename, &hash, &sam_bytes),
+        RepoSource::Deb => publish_to_deb(base, config, &manifest, &filename, &hash, &sam_bytes),
+        RepoSource::Rpm => publish_to_rpm(base, &manifest, &filename, &hash, &sam_bytes),
     }?;
 
     // Sign Release file if signing key is configured
@@ -358,7 +360,7 @@ fn publish_to_native(
     Ok(())
 }
 
-fn publish_to_apt(
+fn publish_to_deb(
     base: &std::path::Path,
     config: &RepoConfig,
     manifest: &crate::types::Manifest,
@@ -418,11 +420,11 @@ fn publish_to_apt(
     std::fs::write(&packages_gz_path, &compressed)
         .map_err(|e| SpmError::config(format!("Cannot write Packages.gz: {e}")))?;
 
-    crate::output::step_success(format!("Published {} to apt repo ({}/{})", filename, codename, component));
+    crate::output::step_success(format!("Published {} to deb repo ({}/{})", filename, codename, component));
     Ok(())
 }
 
-fn publish_to_dnf(
+fn publish_to_rpm(
     base: &std::path::Path,
     manifest: &crate::types::Manifest,
     filename: &str,
@@ -533,7 +535,7 @@ fn publish_to_dnf(
     std::fs::write(&filelists_path, &compressed)
         .map_err(|e| SpmError::config(format!("Cannot write filelists.xml.gz: {e}")))?;
 
-    crate::output::step_success(format!("Published {} to dnf repo", filename));
+    crate::output::step_success(format!("Published {} to rpm repo", filename));
     Ok(())
 }
 
@@ -545,7 +547,7 @@ pub fn remove_repo(name: &str) -> SpmResult<()> {
             .map_err(|e| SpmError::config(format!("Cannot remove {:?}: {e}", path)))?;
     }
     // Clean up cached data for this repo
-    for sub in &["apt", "dnf", "native"] {
+    for sub in &["deb", "rpm", "native"] {
         let cache_dir = paths::repos_cache_dir().join(sub).join(name);
         if cache_dir.exists() {
             let _ = fs::remove_dir_all(&cache_dir);
@@ -593,8 +595,8 @@ pub fn update_repos() -> SpmResult<()> {
     let mut updated = 0u32;
     for (name, config) in &repos {
         let result = match config.source {
-            RepoSource::Apt => update_from_apt(name, config),
-            RepoSource::Dnf => update_from_dnf(name, config),
+            RepoSource::Deb => update_from_deb(name, config),
+            RepoSource::Rpm => update_from_rpm(name, config),
             RepoSource::Native => update_from_native(name, config),
         };
         match result {
@@ -618,13 +620,13 @@ pub fn update_repos() -> SpmResult<()> {
     Ok(())
 }
 
-fn update_from_apt(name: &str, config: &RepoConfig) -> SpmResult<()> {
-    let cache = paths::repos_cache_dir().join("apt").join(name);
+fn update_from_deb(name: &str, config: &RepoConfig) -> SpmResult<()> {
+    let cache = paths::repos_cache_dir().join("deb").join(name);
     let sources_file = PathBuf::from("/etc/apt/sources.list");
     let sources_d = PathBuf::from("/etc/apt/sources.list.d");
 
     fs::create_dir_all(&cache)
-        .map_err(|e| SpmError::config(format!("Cannot create apt cache: {e}")))?;
+        .map_err(|e| SpmError::config(format!("Cannot create deb cache: {e}")))?;
 
     let mut found = false;
 
@@ -688,17 +690,17 @@ fn update_from_apt(name: &str, config: &RepoConfig) -> SpmResult<()> {
     }
 
     if !found {
-        tracing::warn!("No apt sources found for '{name}'");
+        tracing::warn!("No deb sources found for '{name}'");
     }
     Ok(())
 }
 
-fn update_from_dnf(name: &str, _config: &RepoConfig) -> SpmResult<()> {
-    let cache = paths::repos_cache_dir().join("dnf").join(name);
+fn update_from_rpm(name: &str, _config: &RepoConfig) -> SpmResult<()> {
+    let cache = paths::repos_cache_dir().join("rpm").join(name);
     let repos_d = PathBuf::from("/etc/yum.repos.d");
 
     fs::create_dir_all(&cache)
-        .map_err(|e| SpmError::config(format!("Cannot create dnf cache: {e}")))?;
+        .map_err(|e| SpmError::config(format!("Cannot create rpm cache: {e}")))?;
 
     let mut found = false;
     if repos_d.exists() {
@@ -719,7 +721,7 @@ fn update_from_dnf(name: &str, _config: &RepoConfig) -> SpmResult<()> {
     }
 
     if !found {
-        tracing::warn!("No dnf/yum repos found on this system");
+        tracing::warn!("No rpm/yum repos found on this system");
     }
     Ok(())
 }
@@ -760,13 +762,13 @@ pub fn detect_source() -> RepoSource {
             if let Some(val) = line.strip_prefix("ID=") {
                 let id = val.trim_matches('"').to_lowercase();
                 if id == "debian" || id == "ubuntu" || id == "linuxmint" || id == "kali" {
-                    return RepoSource::Apt;
+                    return RepoSource::Deb;
                 }
                 if id == "fedora" || id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux" {
-                    return RepoSource::Dnf;
+                    return RepoSource::Rpm;
                 }
                 if id == "opensuse-leap" || id == "opensuse-tumbleweed" || id == "suse" {
-                    return RepoSource::Dnf;
+                    return RepoSource::Rpm;
                 }
             }
         }
@@ -861,8 +863,8 @@ pub fn sign_repo(repo_name: &str) -> SpmResult<()> {
 
     match config.source {
         RepoSource::Native => sign_native_repo(base, &signing_key)?,
-        RepoSource::Apt => sign_apt_repo(base, &signing_key)?,
-        RepoSource::Dnf => sign_dnf_repo(base, &signing_key)?,
+        RepoSource::Deb => sign_deb_repo(base, &signing_key)?,
+        RepoSource::Rpm => sign_rpm_repo(base, &signing_key)?,
     }
 
     crate::output::step_success(format!("Signed Release file for '{repo_name}'"));
@@ -900,7 +902,7 @@ fn sign_native_repo(base: &std::path::Path, signing_key: &ed25519_dalek::Signing
     Ok(())
 }
 
-fn sign_apt_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey) -> SpmResult<()> {
+fn sign_deb_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey) -> SpmResult<()> {
     use base64::Engine;
     use ed25519_dalek::Signer;
 
@@ -938,7 +940,7 @@ fn sign_apt_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey
     let gpg_path = match find_gpg() {
         Some(path) => path,
         None => return Err(SpmError::config(
-            "gpg binary not found in PATH. Install gnupg to generate apt-compatible InRelease files."
+            "gpg binary not found in PATH. Install gnupg to generate deb-compatible InRelease files."
         )),
     };
 
@@ -947,6 +949,7 @@ fn sign_apt_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey
     fs::write(release_tmp.path(), &release_content)
         .map_err(|e| SpmError::config(format!("Cannot write temp Release: {e}")))?;
 
+    // distro integration hook — replace with sequoia-openpgp or ed25519-dalek when possible
     let output = Command::new(&gpg_path)
         .args(["--clearsign", "--batch", "--yes", "-o"])
         .arg(&inrelease_path)
@@ -1002,7 +1005,7 @@ fn collect_release_entries(root: &std::path::Path, dir: &std::path::Path, entrie
     Ok(())
 }
 
-fn sign_dnf_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey) -> SpmResult<()> {
+fn sign_rpm_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey) -> SpmResult<()> {
     use base64::Engine;
     use ed25519_dalek::Signer;
 
@@ -1071,8 +1074,8 @@ fn sign_after_publish(_name: &str, config: &RepoConfig, base: &std::path::Path) 
 
         match config.source {
             RepoSource::Native => sign_native_repo(base, &signing_key)?,
-            RepoSource::Apt => sign_apt_repo(base, &signing_key)?,
-            RepoSource::Dnf => sign_dnf_repo(base, &signing_key)?,
+            RepoSource::Deb => sign_deb_repo(base, &signing_key)?,
+            RepoSource::Rpm => sign_rpm_repo(base, &signing_key)?,
         }
         crate::output::step_success("Signed Release file");
     }

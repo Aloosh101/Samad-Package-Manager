@@ -1,5 +1,4 @@
-use std::collections::{HashSet, BTreeSet};
-use std::process::Command;
+use std::collections::HashSet;
 
 use pubgrub::{
     Dependencies, DependencyConstraints, DependencyProvider,
@@ -19,6 +18,16 @@ type VS = Ranges<V>;
 /// "libc6 (>= 2.31)" -> "libc6"
 /// "libc6 >= 2.31" -> "libc6"
 fn extract_soname_name(raw: &str) -> &str {
+    raw.split_once(' ')
+        .map(|(n, _)| n.trim())
+        .unwrap_or(raw)
+        .split('(')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+}
+
+pub fn extract_dep_name(raw: &str) -> &str {
     raw.split_once(' ')
         .map(|(n, _)| n.trim())
         .unwrap_or(raw)
@@ -278,139 +287,28 @@ pub fn resolve_with_solver(
     }
 }
 
-/// Fallback: use the native package manager's dependency resolver when
-/// PubGrub cannot find a solution (incomplete SONAME index, etc.).
+/// Fallback: when PubGrub cannot find a solution, try reading from the
+/// SONAME index directly.  This is still a pure-Rust path.
 fn fallback_to_native_resolver(
     root_package: &str,
-    format: &PackageFormat,
+    _format: &PackageFormat,
 ) -> SpmResult<Vec<PackageId>> {
-    match format {
-        PackageFormat::Deb => resolve_with_apt_simulate(root_package),
-        PackageFormat::Rpm => resolve_with_dnf_repoquery(root_package),
-        PackageFormat::Sam => Err(SpmError::resolution_failed(format!(
-            "Cannot resolve SAM package '{}' — no native backend available", root_package
-        ))),
-    }
-}
-
-/// Parse `dnf repoquery --requires --resolve <pkg>` output to get the
-/// transitive dependency closure of an RPM package.
-fn resolve_with_dnf_repoquery(package: &str) -> SpmResult<Vec<PackageId>> {
-    let output = Command::new(crate::util::backend::resolve("dnf"))
-        .args(["repoquery", "--qf", "%{name}", "--requires", "--resolve", package])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("dnf repoquery failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::resolution_failed(format!(
-            "dnf repoquery failed for '{}': {stderr}",
-            package,
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut seen = BTreeSet::new();
+    let index = SonameIndex::load()?;
     let mut pkgs = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(root_package.to_string());
+    pkgs.push(PackageId::new(root_package, _format.clone()));
 
-    // First package is the root itself — skip it
-    for line in stdout.lines() {
-        let name = line.trim();
-        if name.is_empty() || name == package {
-            continue;
-        }
-        if seen.insert(name.to_string()) {
-            pkgs.push(PackageId::new(name, PackageFormat::Rpm));
+    // Walk requires from the SONAME index to build the closure
+    if let Some(requires) = index.get_requires(root_package) {
+        for req in requires {
+            let name = extract_soname_name(req);
+            if !name.is_empty() && seen.insert(name.to_string()) {
+                let fmt = _format.clone();
+                pkgs.push(PackageId::new(name, fmt));
+            }
         }
     }
-
-    // Include the root package itself
-    pkgs.insert(0, PackageId::new(package, PackageFormat::Rpm));
 
     Ok(pkgs)
-}
-
-/// Parse `apt-get --simulate install <pkg>` output to extract the list
-/// of packages that would be installed.
-fn resolve_with_apt_simulate(package: &str) -> SpmResult<Vec<PackageId>> {
-    let output = Command::new(crate::util::backend::resolve("apt-get"))
-        .args(["--simulate", "install", package])
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("apt-get --simulate failed: {e}")))?;
-
-    // apt-get --simulate outputs to stderr, exit code 0 means success
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut pkgs = Vec::new();
-    let mut in_install_list = false;
-    let mut in_upgrade_list = false;
-
-    for line in stderr.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("The following NEW packages will be installed:") {
-            in_install_list = true;
-            in_upgrade_list = false;
-            continue;
-        }
-        if trimmed.starts_with("The following packages will be upgraded:") {
-            in_upgrade_list = true;
-            in_install_list = false;
-            continue;
-        }
-        if trimmed.starts_with("The following packages will be REMOVED:")
-            || trimmed.starts_with("The following packages have been kept back:")
-            || trimmed.starts_with("0 upgraded,")
-            || trimmed.starts_with("Need to get")
-        {
-            in_install_list = false;
-            in_upgrade_list = false;
-            continue;
-        }
-
-        if in_install_list || in_upgrade_list {
-            // Lines look like: "  figlet libc6 libstdc++6"
-            // or continuation lines starting with spaces
-            for word in trimmed.split_whitespace() {
-                let word = word.trim_end_matches(',');
-                if !word.is_empty()
-                    && !word.starts_with('(')
-                    && !word.starts_with('[')
-                {
-                    pkgs.push(PackageId::new(word, PackageFormat::Deb));
-                }
-            }
-        }
-    }
-
-    if pkgs.is_empty() {
-        // Try parsing the "Inst " lines as fallback
-        for line in stderr.lines() {
-            if let Some(dep) = line.strip_prefix("Inst ") {
-                if let Some(name) = dep.split_whitespace().next() {
-                    pkgs.push(PackageId::new(name, PackageFormat::Deb));
-                }
-            }
-        }
-    }
-
-    if pkgs.is_empty() {
-        return Err(SpmError::resolution_failed(format!(
-            "apt-get --simulate returned no packages for '{}':\n{}",
-            package, stderr
-        )));
-    }
-
-    // Deduplicate while preserving order
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
-    for pkg in pkgs {
-        if seen.insert(pkg.name.clone()) {
-            deduped.push(pkg);
-        }
-    }
-
-    Ok(deduped)
 }

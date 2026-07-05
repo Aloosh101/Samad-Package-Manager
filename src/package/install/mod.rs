@@ -2,8 +2,8 @@
 mod tests {
     #[test]
     fn test_source_to_format() {
-        assert_eq!(super::source_to_format(&super::RepoSource::Apt), super::PackageFormat::Deb);
-        assert_eq!(super::source_to_format(&super::RepoSource::Dnf), super::PackageFormat::Rpm);
+        assert_eq!(super::source_to_format(&super::RepoSource::Deb), super::PackageFormat::Deb);
+        assert_eq!(super::source_to_format(&super::RepoSource::Rpm), super::PackageFormat::Rpm);
         assert_eq!(super::source_to_format(&super::RepoSource::Native), super::PackageFormat::Sam);
     }
 }
@@ -11,7 +11,6 @@ mod tests {
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
-use std::process::Command;
 
 use crate::config::{paths, repos};
 use crate::db;
@@ -20,6 +19,7 @@ use crate::package::{resolver, transaction::TransactionEngine};
 use crate::types::*;
 use crate::verify;
 
+mod conflict;
 mod local;
 mod sandbox;
 mod remove;
@@ -28,6 +28,7 @@ mod upgrade;
 
 pub use remove::{purge_package, remove_package};
 pub use upgrade::{dist_upgrade_packages, upgrade_package};
+pub use self::conflict::{ConflictMediator, PackageManagerDetector, ProcessFreezer, Resolution, StoreManager};
 pub use self::local::install_local_package;
 pub use user::{install_for_user, remove_for_user};
 
@@ -45,8 +46,8 @@ fn ensure_dirs() -> SpmResult<()> {
     Ok(())
 }
 
-pub fn install_package(name: &str, sandbox: Option<&str>, replace: bool, yes: bool, strategy: VersionStrategy) -> SpmResult<()> {
-    install_package_smart(name, sandbox, replace, yes, false, strategy, None)
+pub fn install_package(name: &str, sandbox: Option<&str>, replace: bool, yes: bool, smart: bool, strategy: VersionStrategy) -> SpmResult<()> {
+    install_package_smart(name, sandbox, replace, yes, smart, strategy, None)
 }
 
 pub fn install_package_smart(
@@ -152,10 +153,10 @@ fn try_install_from_repo(
             let mut buf = String::new();
             if std::io::stdin().read_line(&mut buf).is_ok() {
                 match buf.trim().to_lowercase().as_str() {
-                    "f" | "full" => return install_package(name, Some("full"), replace, yes, strategy),
-                    "sd" | "standard" => return install_package(name, Some("standard"), replace, yes, strategy),
-                    "st" | "strict" => return install_package(name, Some("strict"), replace, yes, strategy),
-                    "y" | "yes" => return install_package(name, Some("standard"), replace, yes, strategy),
+                    "f" | "full" => return install_package(name, Some("full"), replace, yes, smart, strategy),
+                    "sd" | "standard" => return install_package(name, Some("standard"), replace, yes, smart, strategy),
+                    "st" | "strict" => return install_package(name, Some("strict"), replace, yes, smart, strategy),
+                    "y" | "yes" => return install_package(name, Some("standard"), replace, yes, smart, strategy),
                     _ => {}
                 }
             }
@@ -194,9 +195,9 @@ fn try_install_from_repo(
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_ok() {
             match buf.trim().to_lowercase().as_str() {
-                "f" | "full" => return install_package(name, Some("full"), replace, yes, strategy),
-                "sd" | "standard" => return install_package(name, Some("standard"), replace, yes, strategy),
-                "st" | "strict" => return install_package(name, Some("strict"), replace, yes, strategy),
+                "f" | "full" => return install_package(name, Some("full"), replace, yes, smart, strategy),
+                "sd" | "standard" => return install_package(name, Some("standard"), replace, yes, smart, strategy),
+                "st" | "strict" => return install_package(name, Some("strict"), replace, yes, smart, strategy),
                 _ => {}
             }
         }
@@ -274,38 +275,20 @@ pub fn install_package_from_repo(name: &str, source: RepoSource, replace: bool, 
 
 pub(crate) fn repo_has_package(name: &str, repo_name: &str, repo_config: &RepoConfig) -> bool {
     match repo_config.source {
-        RepoSource::Apt => {
-            let has_apt_cache = Command::new(crate::util::backend::resolve("apt-cache"))
-                .args(["show", name])
-                .stderr(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .status()
-                .ok()
-                .is_some_and(|s| s.success());
-            if has_apt_cache {
-                return true;
-            }
-            // Fall back to cached Packages.gz (HTTP-based apt)
-            let apt_cache = crate::config::paths::repos_cache_dir().join("apt");
-            if apt_cache.exists() {
-                if let Ok(entries) = fs::read_dir(&apt_cache) {
+        RepoSource::Deb => {
+            // Check cached Packages files (from spm update)
+            let deb_cache = crate::config::paths::repos_cache_dir().join("deb").join(repo_name);
+            if deb_cache.exists() {
+                if let Ok(entries) = fs::read_dir(&deb_cache) {
                     for entry in entries.flatten() {
-                        let dir = entry.path();
-                        if !dir.is_dir() {
-                            continue;
-                        }
-                        if let Ok(pkg_entries) = fs::read_dir(&dir) {
-                            for pkg_entry in pkg_entries.flatten() {
-                                let pkg_path = pkg_entry.path();
-                                if let Some(name_str) = pkg_path.file_name().and_then(|s| s.to_str()) {
-                                    if name_str.starts_with("Packages-") {
-                                        if let Ok(text) = fs::read_to_string(&pkg_path) {
-                                            for line in text.lines() {
-                                                if let Some(pkg_name) = line.strip_prefix("Package: ") {
-                                                    if pkg_name.eq_ignore_ascii_case(name) {
-                                                        return true;
-                                                    }
-                                                }
+                        let pkg_path = entry.path();
+                        if let Some(name_str) = pkg_path.file_name().and_then(|s| s.to_str()) {
+                            if name_str.starts_with("Packages-") {
+                                if let Ok(text) = fs::read_to_string(&pkg_path) {
+                                    for line in text.lines() {
+                                        if let Some(pkg_name) = line.strip_prefix("Package: ") {
+                                            if pkg_name.eq_ignore_ascii_case(name) {
+                                                return true;
                                             }
                                         }
                                     }
@@ -317,16 +300,24 @@ pub(crate) fn repo_has_package(name: &str, repo_name: &str, repo_config: &RepoCo
             }
             false
         }
-        RepoSource::Dnf => {
-            Command::new(crate::util::backend::resolve("dnf"))
-                .args(["repoquery", "--info", name])
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
+        RepoSource::Rpm => {
+            // Check SONAME index for the package (from spm update)
+            if let Ok(index) = crate::index::SonameIndex::load() {
+                if let Some(providers) = index.get_providers(name) {
+                    return providers.iter().any(|p| p.source == RepoSource::Rpm);
+                }
+            }
+            // Also check cached repo-index.json
+            let cache_dir = crate::config::paths::repos_cache_dir().join("rpm").join(repo_name);
+            let index_path = cache_dir.join("repo-index.json");
+            if let Ok(content) = fs::read_to_string(&index_path) {
+                if let Ok(index) = serde_json::from_str::<crate::types::RepoIndex>(&content) {
+                    return index.packages.iter().any(|p| p.name == name);
+                }
+            }
+            false
         }
         RepoSource::Native => {
-            // Check the cached repo index for the package
             let cache_dir = crate::config::paths::repos_cache_dir().join("native").join(repo_name);
             let index_path = cache_dir.join("repo-index.json");
             if let Ok(content) = fs::read_to_string(&index_path) {
@@ -341,8 +332,8 @@ pub(crate) fn repo_has_package(name: &str, repo_name: &str, repo_config: &RepoCo
 
 fn source_to_format(source: &RepoSource) -> PackageFormat {
     match source {
-        RepoSource::Apt => PackageFormat::Deb,
-        RepoSource::Dnf => PackageFormat::Rpm,
+        RepoSource::Deb => PackageFormat::Deb,
+        RepoSource::Rpm => PackageFormat::Rpm,
         RepoSource::Native => PackageFormat::Sam,
     }
 }

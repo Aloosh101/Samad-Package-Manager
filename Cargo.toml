@@ -1,6 +1,6 @@
 [package]
 name = "spm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Samad Package Manager - A universal Linux package manager"
 authors = ["aloosh101"]
@@ -16,6 +16,7 @@ path = "src/bin/spmd.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -31,15 +32,29 @@ walkdir = "2"
 tar = "0.4.46"
 flate2 = "1.1.9"
 ureq = "3.0"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs", "io-util", "sync", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking", "gzip", "brotli", "zstd"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "fs", "io-util", "sync", "macros", "time", "process"] }
 fd-lock = "4.0"
 libc = "0.2"
-nix = { version = "0.29", features = ["user", "fs"] }
+nix = { version = "0.29", features = ["user", "fs", "process", "sched", "signal"] }
 tempfile = "3"
 sha2 = "0.10"
 urlencoding = "2"
 quick-xml = "0.36"
 pubgrub = "0.4.0"
+futures = "0.3"
+bytes = "1.5"
+indicatif = "0.17"
+console = "0.15"
+dialoguer = "0.11"
+colored = "2"
+notify = "6"
+xz2 = "0.1"
+caps = "0.4"
+
+sequoia-openpgp = { version = "2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+goblin = "0.9"
+scroll = "0.12"
 
 [dependencies.ed25519-dalek]
 version = "2"

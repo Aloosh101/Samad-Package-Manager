@@ -2,45 +2,50 @@
 
 ## Overview
 
-SPM (Samad Package Manager) is a Unix package manager that manages its own
-backend binaries (dnf, apt, rpm, dpkg) in complete isolation from the system.
-It adds its own management layer (SQLite database, .sam format, transaction
-log, sandboxing, analysis) while using the managed backends for package
-discovery and download.  The system `PATH` is never consulted for backend
-resolution — SPM is the sole package manager visible to the user.
+SPM (Samad Package Manager) is a universal Linux package manager written in Rust.
+It uses a BLAKE3 content-addressed store for deduplication, PubGrub for dependency
+resolution, and Linux namespace isolation for sandboxing. SPM can install `.deb`,
+`.rpm`, and native `.sam` packages across distributions with file conflict detection,
+atomic transactions, and Ed25519 signature verification.
 
 ```
-            CLI (clap — 25 subcommands)
-                │
-                ▼
-        ┌───────┴───────┐
-        │   error.rs    │  SpmError enum + SpmResult<T>
-        └───────┬───────┘
-                │
-        ┌───────┴───────┐
-        │   types/      │  Package, Manifest, Transaction, SpmConfig, RepoConfig, Version…
-        └───────┬───────┘
-                │
-        ┌───────┼───────────────┬────────────────┐
-        ▼       ▼               ▼                ▼
-     db/      config/        package/        util/
-     SQLite   repos.d        install          hash
-     metadata  TOML          sam              process
-     packages/               deb              fs (whoami, is_elf)
-     transactions/           rpm              backend
-     files/                  fetch/           process
-     users/                  resolver/
-     mapping/                transaction/
-     conflict/               scripts/
-                             store (origin-prefixed, cross-distro)
-                             hooks, cleanup, solver
-                                │
-                      ┌────────┴────────┐
-                      ▼                 ▼
-                  sandbox/          analyze/
-                  bwrap             orphan
-                                    conflict
-                                    trace
+                      spm (CLI — 28 subcommands)
+                            │
+                            ▼
+                    ┌───────┴───────┐
+                    │   error.rs    │  SpmError + SpmResult
+                    └───────┬───────┘
+                            │
+                    ┌───────┴───────┐
+                    │   types/     │  PackageId, Manifest, Version, Config…
+                    └───────┬───────┘
+                            │
+            ┌───────────────┼───────────────────┬──────────────────┐
+            ▼               ▼                   ▼                  ▼
+         db/            config/             package/            util/
+         SQLite         repos.d TOML       install/             hash
+         metadata       spm.conf           extract/             process
+         packages/                         fetch/               fs
+         transactions/                     resolver/            backend
+         files/                            sandbox/
+         mapping/                          scripts/
+         conflict/                         solver
+         users/                            store
+                                           cleanup
+                                           query
+              │               │                   │                  │
+              ▼               ▼                   ▼                  ▼
+         daemon/          analyze/            isolation/         store/
+         socket           orphans             detector           dedup
+         permission       conflicts           freezer            hardlink
+         transaction      cycles              mediator           gc
+         service          trace
+                                            ─────────
+              │               │            ux/                  │
+              ▼               ▼            progress             ▼
+          bootstrap/       fsck/           prompts           cache/
+          init             integrity       formatter          file cache
+                                            completions       hash store
 ```
 
 ## 1. `src/bin/spm.rs` — Entry Point (25 lines)
@@ -257,15 +262,38 @@ autoremove_packages()
   - `search_file_owner()`: queries SPM DB files table → falls back to dpkg -S / rpm -qf
 - `hooks.rs` (162 lines): hook scripts
 
-## 9. `src/sandbox/mod.rs` (155 lines) — Isolation
+## 9. `src/package/sandbox/` — Sandbox System (6 files)
 
-- `list_sandboxes()`: lists all sandboxed packages
-- `run_in_sandbox()`: pure namespace isolation (no bwrap, no chroot)
-  - PID namespace: `CLONE_NEWPID` in parent
-  - Mount namespace: `CLONE_NEWNS` + `MS_PRIVATE` + tmpfs on /tmp + read-only root
-  - Network namespace: `CLONE_NEWNET` — no external connectivity
-  - UTS namespace: `CLONE_NEWUTS` + hostname "sandbox"
-  - PATH/LD_LIBRARY_PATH isolation for sandbox binaries
+### `mod.rs` — SandboxBuilder with 4 isolation levels
+- `None` — standard install, no isolation
+- `Standard` — PATH/LD_LIBRARY_PATH isolation
+- `Strict` — namespaces + read-only root
+- `Full` — namespaces + seccomp + landlock + cgroups
+
+### `namespaces.rs` — Linux namespace isolation
+- `unshare(CLONE_NEWPID)` — child becomes PID 1
+- `unshare(CLONE_NEWNS)` + `MS_PRIVATE|MS_REC` — private mount tree
+- `mount("tmpfs", "/tmp", "tmpfs")` — isolated temp
+- `MS_REMOUNT|MS_RDONLY` — read-only root
+- `unshare(CLONE_NEWNET)` — no network
+- `unshare(CLONE_NEWUTS)` + `sethostname("sandbox")` — hidden hostname
+
+### `seccomp.rs` — BPF syscall allowlist
+- Allows ~50 safe syscalls (read, write, mmap, etc.)
+- Blocks raw io, module loading, kexec, user namespaces, etc.
+
+### `landlock.rs` — Landlock LSM rules
+- Read-only access to `/usr/lib`, `/usr/share`
+- Read-write access to sandboxed package directory
+
+### `cgroups.rs` — Cgroup v2 resource limits
+- CPU quota, memory max, IO weight
+- OOM killer protection
+
+### `launcher.rs` — Process launcher
+- Forks child in new namespaces
+- Applies seccomp + landlock + cgroup before exec
+- Falls back gracefully if any feature unavailable
 
 ## 10. `src/analyze/mod.rs` (419 lines) — Analysis
 
@@ -334,6 +362,120 @@ resolve("dnf"):
 
 - `verify_manifest_signature()`: Ed25519 signature verification
 - `prompt_before_install()`: user confirmation prompt
+
+## 16. `src/package/fetch/verify.rs` — Package Verification
+
+- `KeyStore` — Ed25519 verifying key storage with key_id lookup
+- `Verifier` — verification orchestrator
+  - `verify_debian()` — SHA256 hash check from deb822 metadata
+  - `verify_rpm()` — RPM signature header verification
+  - `verify_sam()` — Ed25519 manifest signature verification
+- `serialize_manifest_for_verification()` — canonical manifest serialization
+
+## 17. `src/package/extract/` — Pure Rust Extraction
+
+### `deb.rs` — `.deb` extractor (no ar/dpkg-deb needed)
+- Parses `ar` archive header
+- Extracts `control.tar.*` and `data.tar.*`
+- Handles `xz`, `gz`, `zstd` compression via xz2/flate2/zstd crates
+- Parses `debian-binary` version file
+
+### `rpm.rs` — `.rpm` extractor (no rpm2cpio needed)
+- Parses RPM lead + header index (tag/value entries)
+- Extracts payload via cpio newc format reader
+- Handles `gz`, `xz`, `zstd` compressed payloads
+
+## 18. `src/package/resolver/` — Dependency Resolver (3 files)
+
+### `mod.rs` — 5-phase resolution pipeline
+1. `phase1_fetch_metadata()` — fetches package metadata from repos
+2. `phase2_solve_dependencies()` — PubGrub SAT solving
+3. `phase3_detect_cycles()` — Tarjan SCC algorithm
+4. `phase4_detect_conflicts()` — file-level conflict detection
+5. `phase5_topological_sort()` — Kahn's algorithm
+
+### `graph.rs` — Resolution graph types
+- `ResolvedGraph` — topological order, cycles, alternatives, conflicts
+- `Alternative` — `(PackageId, Reason)` for version alternatives
+- `ConflictType` — `VersionMismatch`, `FileConflict`, `CyclicDependency`
+
+### `cache.rs` — Dependency cache with TTL + epoch
+- `DependencyCache` — in-memory LRU with 300s TTL
+- `current_dep_cache_epoch()` — bumped by `spm update`
+
+## 19. `src/store/` — Content-Addressed Store (4 files)
+
+### `deduplication.rs` — Content-addressed storage
+- Files stored by BLAKE3 hash, sharded by first 2 hex chars
+- `store/origin/{shard}/{hash}/file` — origin-prefixed (deb/rpm/sam)
+- Same content → same hash → zero extra disk space
+
+### `hardlink.rs` — Hardlink management
+- Links store paths to target directories
+- Maintains link reference counts in SQLite
+- Safe cleanup on GC
+
+### `gc.rs` — Garbage collection
+- Scans store for unreferenced hashes
+- Respects origin prefixes
+- Dry-run mode for preview
+
+## 20. `src/isolation/` — Foreign Package Manager Integration
+
+### `detector.rs` — PackageManagerDetector
+- Probes for dpkg/rpm/pacman on the system
+- Watches for foreign package manager invocations via inotify
+
+### `freezer.rs` — ProcessFreezer
+- SIGSTOP / SIGCONT for process suspension
+- SIGKILL for forceful termination
+- Tracks frozen process list
+
+### `mediator.rs` — ConflictMediator
+- Detects file conflicts between SPM and foreign packages
+- Presents resolution options (Allow, Deny, Sandbox)
+- Integrates with `ux::prompts::SpmPrompts`
+
+## 21. `src/daemon/permission.rs` — Permission Engine
+
+- `PeerCreds` — UID/PID/GID from `SO_PEERCRED`
+- `PermissionPolicy` — allowed operations per user
+- `check_permission()` — validates file access and operations
+- Membership check against `spm` UNIX group
+
+## 22. `src/daemon/transaction.rs` — Transaction Manager
+
+- `TransactionManager` — orchestrates 6-phase atomic install:
+  1. Fetch + verify package
+  2. Detect conflicts
+  3. Prepare store (deduplicate, hardlink)
+  4. Pre-install script execution
+  5. Database commit (atomic SQLite)
+  6. Post-install script execution
+- `RollbackGuard` — Drop-based rollback on panic/failure
+
+## 23. `src/ux/` — User Experience Layer
+
+### `progress.rs` — SpmProgress
+- MultiProgress via indicatif
+- `progress_bar()` — per-operation progress bars
+- `spinner()` — indeterminate operation spinner
+- `set_message()` / `finish_with_message()`
+
+### `prompts.rs` — SpmPrompts
+- `confirm_install()` — package list confirmation
+- `select_conflict_resolution()` — conflict resolution picker
+- `select_foreign_touch_action()` — foreign process action picker
+- Uses dialoguer with colored themes
+
+### `formatter.rs` — SpmFormatter
+- `print_install_summary()` — formatted install results
+- `print_error_actionable()` — error with fix suggestions
+- Colored output via `colored` crate
+
+### `completions.rs` — Shell completions
+- Generates bash/zsh/fish completion scripts
+- Uses clap_complete with custom shell detection
 
 ## Data Flow: `spm install curl`
 

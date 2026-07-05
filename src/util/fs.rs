@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::integration;
+
 pub fn is_elf(path: &Path) -> bool {
     let mut buf = [0u8; 4];
     std::fs::File::open(path)
@@ -15,20 +17,12 @@ pub fn whoami() -> String {
 }
 
 pub fn host_arch() -> String {
-    std::process::Command::new("uname")
-        .arg("-m")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("x86_64".to_string())
+    integration::kernel::host_arch()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn test_is_elf_actual_elf() {

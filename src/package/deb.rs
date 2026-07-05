@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::Read;
-use std::path::Path;
 
 use crate::error::{SpmError, SpmResult};
 use crate::types::{Dependency, DependencySource, Package, PackageFormat};
@@ -48,48 +47,12 @@ fn normalize_ar_name(name: &str) -> &str {
 }
 
 pub fn extract_deb(path: &str, target: &str) -> SpmResult<()> {
-    let backend = crate::util::backend::resolve("dpkg-deb");
-    extract_deb_with(path, target, &backend)
-        .or_else(|_| extract_deb_with(path, target, Path::new("dpkg-deb")))
-}
-
-fn extract_deb_with(path: &str, target: &str, cmd: &Path) -> SpmResult<()> {
-    let output = std::process::Command::new(cmd)
-        .args(["-x", path, target])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run dpkg-deb: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::invalid_format(format!(
-            "Failed to extract .deb '{}': {}",
-            path,
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
+    let data = std::fs::read(path)
+        .map_err(|e| SpmError::invalid_format(format!("Failed to read .deb file '{}': {}", path, e)))?;
+    crate::package::extract::deb::extract_deb_sync(&data, std::path::Path::new(target))
 }
 
 pub fn parse_deb_control(path: &str) -> SpmResult<Package> {
-    let backend = crate::util::backend::resolve("dpkg-deb");
-    parse_deb_control_with(path, &backend)
-        .or_else(|_| parse_deb_control_with(path, Path::new("dpkg-deb")))
-}
-
-fn parse_deb_control_with(path: &str, cmd: &Path) -> SpmResult<Package> {
-    let output = std::process::Command::new(cmd)
-        .args(["-f", path])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run dpkg-deb -f: {e}")))?;
-
-    if output.status.success() {
-        let control_content = String::from_utf8_lossy(&output.stdout);
-        if !control_content.is_empty() {
-            return parse_deb822(&control_content, path);
-        }
-    }
-
     parse_deb_control_fallback(path)
 }
 
@@ -110,7 +73,12 @@ fn parse_deb_control_fallback(path: &str) -> SpmResult<Package> {
         if name.starts_with("control.tar") {
             let mut decompressed = Vec::new();
 
-            if let Ok(mut decoder) = zstd::Decoder::new(&data[..]) {
+            if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+                let mut decoder = zstd::Decoder::new(&data[..])
+                    .map_err(|e| SpmError::compression(format!("zstd init: {e}")))?;
+                decoder.read_to_end(&mut decompressed)?;
+            } else if data.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
+                let mut decoder = xz2::read::XzDecoder::new(&data[..]);
                 decoder.read_to_end(&mut decompressed)?;
             } else {
                 let mut decoder = flate2::read::GzDecoder::new(&data[..]);

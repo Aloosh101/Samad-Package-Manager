@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use chrono::Utc;
 
@@ -6,114 +7,100 @@ use crate::db;
 use crate::error::{SpmError, SpmResult};
 use crate::types::*;
 
-fn query_dpkg_packages() -> Vec<(String, String)> {
-    let output = std::process::Command::new("dpkg")
-        .args(["--get-selections"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+fn parse_deb822_status(path: &str) -> Vec<(String, String)> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut packages = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1] == "install" {
-            let name = parts[0].to_string();
-            // Query version
-            let ver_output = std::process::Command::new("dpkg")
-                .args(["-s", &name])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output();
-            if let Ok(o) = ver_output {
-                let info = String::from_utf8_lossy(&o.stdout);
-                if let Some(ver_line) = info.lines().find(|l| l.starts_with("Version: ")) {
-                    let version = ver_line.trim_start_matches("Version: ").to_string();
-                    packages.push((name, version));
-                }
-            }
-        }
-    }
-    packages
-}
 
-fn query_rpm_packages() -> Vec<(String, String)> {
-    let output = std::process::Command::new("rpm")
-        .args(["-qa", "--queryformat", "%{NAME} %{VERSION}-%{RELEASE}\n"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut packages = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            packages.push((parts[0].to_string(), parts[1].to_string()));
+    let mut current_name: Option<String> = None;
+    let mut current_ver: Option<String> = None;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            if let (Some(name), Some(version)) = (current_name.take(), current_ver.take()) {
+                packages.push((name, version));
+            }
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("Package: ") {
+            current_name = Some(val.trim().to_string());
+        }
+        if let Some(val) = line.strip_prefix("Version: ") {
+            current_ver = Some(val.trim().to_string());
         }
     }
+    if let (Some(name), Some(version)) = (current_name, current_ver) {
+        packages.push((name, version));
+    }
+
     packages
 }
 
 fn query_dpkg_files(name: &str) -> Vec<String> {
-    let output = std::process::Command::new("dpkg")
-        .args(["-L", name])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        }
-        _ => Vec::new(),
+    let list_path = format!("/var/lib/dpkg/info/{}.list", name);
+    match std::fs::read_to_string(&list_path) {
+        Ok(content) => content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
     }
+}
+
+fn query_rpm_packages() -> Vec<(String, String)> {
+    // Try reading RPM database via sqlite (modern Fedora).
+    let sqlite_path = std::path::Path::new("/var/lib/rpm/rpmdb.sqlite");
+    if sqlite_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(sqlite_path) {
+            if let Ok(mut stmt) = conn.prepare("SELECT name, version || '-' || release FROM packages") {
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                });
+                if let Ok(rows) = rows {
+                    let pkgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                    if !pkgs.is_empty() {
+                        return pkgs;
+                    }
+                }
+            }
+        }
+    }
+    // For BerkeleyDB /var/lib/rpm/Packages we cannot parse without librpm
+    Vec::new()
 }
 
 fn query_rpm_files(name: &str) -> Vec<String> {
-    let output = std::process::Command::new("rpm")
-        .args(["-ql", name])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
+    // Try reading file list from rpm sqlite database
+    let sqlite_path = std::path::Path::new("/var/lib/rpm/rpmdb.sqlite");
+    if sqlite_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(sqlite_path) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT fi.name FROM files fi \
+                 JOIN packages p ON p.packageId = fi.packageId \
+                 WHERE p.name = ?1"
+            ) {
+                if let Ok(rows) = stmt.query_map([name], |row| row.get::<_, String>(0)) {
+                    let files: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                    if !files.is_empty() {
+                        return files;
+                    }
+                }
+            }
         }
-        _ => Vec::new(),
     }
+    Vec::new()
 }
 
 pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
-    // Phase 1: Detect which package manager is available
-    let has_dpkg = std::process::Command::new("dpkg")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .is_some_and(|s| s.success());
-
-    let has_rpm = std::process::Command::new("rpm")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .is_some_and(|s| s.success());
+    let has_dpkg = Path::new("/var/lib/dpkg/status").exists();
+    let has_rpm = Path::new("/var/lib/rpm/Packages").exists()
+        || Path::new("/var/lib/rpm/rpmdb.sqlite").exists();
 
     if !has_dpkg && !has_rpm {
         return Err(SpmError::other(
@@ -122,7 +109,7 @@ pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
     }
 
     let (system_pkgs, pkg_format): (Vec<(String, String)>, PackageFormat) = if has_dpkg {
-        (query_dpkg_packages(), PackageFormat::Deb)
+        (parse_deb822_status("/var/lib/dpkg/status"), PackageFormat::Deb)
     } else {
         (query_rpm_packages(), PackageFormat::Rpm)
     };
@@ -137,7 +124,6 @@ pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
 
         let system_names: HashSet<String> = system_pkgs.iter().map(|(n, _)| n.clone()).collect();
 
-        // Phase 2: Import foreign packages (in system but not in spm DB)
         let mut imported = 0;
         let now = Utc::now().to_rfc3339();
 
@@ -157,7 +143,7 @@ pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
                 db::add_installed_package(conn, &pkg)?;
 
                 if files {
-                    let file_list = if has_dpkg {
+                    let file_list: Vec<String> = if has_dpkg {
                         query_dpkg_files(name)
                     } else {
                         query_rpm_files(name)
@@ -182,12 +168,10 @@ pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
 
         crate::output::step_info(format!("Imported {} foreign packages", imported));
 
-        // Phase 3: Prune stale spm entries (in spm DB but not on system)
         if prune {
             let mut pruned = 0;
             for name in &spm_names {
                 if !system_names.contains(name) {
-                    // Only prune foreign packages automatically
                     if let Some(pkg) = db::get_installed_package(conn, name)? {
                         if matches!(pkg.origin, InstallOrigin::Foreign) {
                             db::remove_installed_package(conn, name)?;
@@ -199,7 +183,6 @@ pub fn sync_system(files: bool, prune: bool) -> SpmResult<()> {
             crate::output::step_info(format!("Pruned {} stale foreign entries", pruned));
         }
 
-        // Phase 4: Show summary
         let (spm_count, foreign_count) = db::count_packages_by_origin(conn)?;
         crate::output::result_message(format!(
             "Sync complete: {} spm-managed + {} foreign = {} total",

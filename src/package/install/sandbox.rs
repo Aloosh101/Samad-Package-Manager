@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use chrono::Utc;
 use rayon::prelude::*;
@@ -8,6 +7,7 @@ use rayon::prelude::*;
 use crate::config::paths;
 use crate::db;
 use crate::error::{SpmError, SpmResult};
+use crate::integration;
 use crate::types::*;
 use crate::verify;
 
@@ -217,25 +217,37 @@ fn sandbox_download_package(name: &str, pkg_tmp: &str) -> SpmResult<()> {
     use crate::config::repos;
     let repos_list = repos::load_repos()?;
     for (_repo_name, repo_config) in &repos_list {
-        let ok = match repo_config.source {
-            RepoSource::Apt => {
-                Command::new(crate::util::backend::resolve("apt-get"))
-                    .args(["download", name, "-o", &format!("Dir::Cache={}", pkg_tmp)])
-                    .output()
-                    .ok()
-                    .is_some_and(|o| o.status.success())
+        match repo_config.source {
+            RepoSource::Deb => {
+                let mirror = repo_config.mirrors.as_ref()
+                    .and_then(|m| m.first().cloned())
+                    .unwrap_or_default();
+                let codename = repo_config.codename.as_deref().unwrap_or("stable");
+                let component = repo_config.components.as_ref()
+                    .and_then(|c| c.first().cloned())
+                    .unwrap_or_default();
+                let result = crate::package::fetch::debian::fetch_debian_package(
+                    name, None, &mirror, codename, &component,
+                );
+                if let Ok(data) = result {
+                    let pkg_path = std::path::Path::new(pkg_tmp).join(format!("{name}.deb"));
+                    if std::fs::write(&pkg_path, &data).is_ok() {
+                        return Ok(());
+                    }
+                }
             }
-            RepoSource::Dnf => {
-                Command::new(crate::util::backend::resolve("dnf"))
-                    .args(["download", "--destdir", pkg_tmp, name])
-                    .output()
-                    .ok()
-                    .is_some_and(|o| o.status.success())
+            RepoSource::Rpm => {
+                if let Some(url) = &repo_config.url {
+                    let result = crate::package::fetch::rpm::fetch_rpm_package(name, None, url.trim_end_matches('/'));
+                    if let Ok(data) = result {
+                        let pkg_path = std::path::Path::new(pkg_tmp).join(format!("{name}.rpm"));
+                        if std::fs::write(&pkg_path, &data).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
             }
-            _ => false,
-        };
-        if ok {
-            return Ok(());
+            _ => {}
         }
     }
     Err(SpmError::package_not_found(format!(
@@ -271,39 +283,37 @@ fn check_missing_libraries(sandbox_dir: &str) -> SpmResult<()> {
         .filter(|p| crate::util::fs::is_elf(p))
         .collect();
 
-    let missing = std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        for chunk in elf_files.chunks(8) {
-            let owned: Vec<_> = chunk.to_vec();
-            handles.push(s.spawn(move || {
-                let mut local_missing = Vec::new();
-                for path in &owned {
-                    let output = match Command::new("ldd").arg(path).output() {
-                        Ok(o) => o,
-                        Err(_) => continue,
-                    };
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if stderr.contains("not a dynamic executable") {
-                        continue;
-                    }
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if line.contains("not found") {
-                            let lib = line.split_whitespace().next().unwrap_or(line);
-                            let relative = path.strip_prefix(sandbox_dir).unwrap_or(path);
-                            local_missing.push(format!("  {} requires {} (not found)", relative.display(), lib));
-                        }
-                    }
+    let lib_search = [
+        "/usr/lib", "/usr/lib64", "/lib", "/lib64",
+        "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
+    ];
+
+    let missing: Vec<String> = elf_files
+        .iter()
+        .filter_map(|path| {
+            let deps = match integration::elf::get_dynamic_dependencies(path) {
+                Ok(d) => d,
+                Err(_) => return None,
+            };
+            if deps.is_empty() {
+                return None;
+            }
+            let mut local = Vec::new();
+            for lib in &deps {
+                let found = lib_search.iter().any(|dir| Path::new(dir).join(lib).exists());
+                if !found {
+                    let relative = path.strip_prefix(sandbox_dir).unwrap_or(path);
+                    local.push(format!("  {} requires {} (not found)", relative.display(), lib));
                 }
-                local_missing
-            }));
-        }
-        let mut all_missing = Vec::new();
-        for h in handles {
-            all_missing.extend(h.join().unwrap());
-        }
-        all_missing
-    });
+            }
+            if local.is_empty() {
+                None
+            } else {
+                Some(local)
+            }
+        })
+        .flatten()
+        .collect();
 
     if missing.is_empty() {
         Ok(())

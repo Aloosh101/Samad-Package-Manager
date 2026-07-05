@@ -32,53 +32,7 @@ fn read_script(path: &Path) -> Option<String> {
 }
 
 pub fn extract_deb_scripts(path: &str, scripts_dir: &str) -> SpmResult<Scripts> {
-    let backend = crate::util::backend::resolve("dpkg-deb");
-    let result = extract_deb_scripts_with(path, scripts_dir, &backend);
-    match result {
-        Ok(scripts) => return Ok(scripts),
-        Err(_) => {
-            // Fall back to host dpkg-deb directly (not via chroot wrapper)
-            if let Ok(scripts) = extract_deb_scripts_with(path, scripts_dir, &PathBuf::from("dpkg-deb")) {
-                return Ok(scripts);
-            }
-        }
-    }
-
-    tracing::warn!("dpkg-deb -e failed for '{path}'. Trying manual extraction...");
     extract_deb_scripts_fallback(path, scripts_dir)
-}
-
-fn extract_deb_scripts_with(path: &str, scripts_dir: &str, cmd: &Path) -> SpmResult<Scripts> {
-    let output = Command::new(cmd)
-        .args(["-e", path, scripts_dir])
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run dpkg-deb -e: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::invalid_format(format!(
-            "dpkg-deb -e failed: {}", stderr.trim()
-        )));
-    }
-
-    let scripts_dir = PathBuf::from(scripts_dir);
-    let mut scripts = Scripts::default();
-
-    for name in &["preinst", "postinst", "prerm", "postrm"] {
-        let script_path = scripts_dir.join(name);
-        if script_path.exists() {
-            let content = fs::read_to_string(&script_path).ok();
-            match *name {
-                "preinst" => scripts.preinst = content,
-                "postinst" => scripts.postinst = content,
-                "prerm" => scripts.prerm = content,
-                "postrm" => scripts.postrm = content,
-                _ => {}
-            }
-        }
-    }
-
-    Ok(scripts)
 }
 
 fn extract_deb_scripts_fallback(path: &str, scripts_dir: &str) -> SpmResult<Scripts> {
@@ -127,7 +81,12 @@ fn extract_deb_scripts_fallback(path: &str, scripts_dir: &str) -> SpmResult<Scri
         let data = read_ar_data(&mut file, size)?;
         if name.starts_with("control.tar") {
             let mut decompressed = Vec::new();
-            if let Ok(mut decoder) = zstd::Decoder::new(&data[..]) {
+            if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+                let mut decoder = zstd::Decoder::new(&data[..])
+                    .map_err(|e| SpmError::compression(format!("zstd init: {e}")))?;
+                decoder.read_to_end(&mut decompressed)?;
+            } else if data.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
+                let mut decoder = xz2::read::XzDecoder::new(&data[..]);
                 decoder.read_to_end(&mut decompressed)?;
             } else {
                 let mut decoder = flate2::read::GzDecoder::new(&data[..]);
@@ -344,26 +303,44 @@ pub fn run_script_in_sandbox(content: &str, phase: &str, sandbox_dir: &str) -> S
         let _ = fs::copy("/bin/sh", &sandbox_sh);
     }
 
-    let output = Command::new("timeout")
-        .arg(SCRIPT_TIMEOUT_SECS.to_string())
-        .arg("chroot")
-        .arg(sandbox_dir)
-        .arg("/bin/sh")
-        .arg("/tmp/script.sh")
-        .arg(phase)
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to execute {phase} script in sandbox: {e}")))?;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::other(format!(
-            "{phase} script failed in sandbox (exit code: {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        )));
+    let (tx, rx) = mpsc::channel();
+    let sandbox_dir = sandbox_dir.to_string();
+    let phase_clone = phase.to_string();
+    let phase_debug = phase.to_string();
+
+    thread::spawn(move || {
+        let output = Command::new("chroot")
+            .arg(&sandbox_dir)
+            .arg("/bin/sh")
+            .arg("/tmp/script.sh")
+            .arg(&phase_clone)
+            .output();
+        let _ = tx.send(output);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(SCRIPT_TIMEOUT_SECS)) {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SpmError::other(format!(
+                    "{phase_debug} script failed in sandbox (exit code: {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                )));
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(SpmError::command_failed(format!(
+            "Failed to execute {phase_debug} script in sandbox: {e}"
+        ))),
+        Err(_) => Err(SpmError::other(format!(
+            "{phase_debug} script in sandbox timed out after {SCRIPT_TIMEOUT_SECS}s"
+        ))),
     }
-
-    Ok(())
 }
 
 pub fn run_script(content: &str, phase: &str) -> SpmResult<()> {
@@ -380,29 +357,47 @@ pub fn run_script(content: &str, phase: &str) -> SpmResult<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
 
-    let output = unsafe {
-        Command::new("timeout")
-            .arg(SCRIPT_TIMEOUT_SECS.to_string())
-            .arg("/bin/sh")
-            .arg(&script_path)
-            .arg(phase)
-            .pre_exec(|| {
-                isolate_child_process()
-            })
-            .output()
-    }
-    .map_err(|e| SpmError::command_failed(format!("Failed to execute {phase} script: {e}")))?;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::other(format!(
-            "{phase} script failed (exit code: {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        )));
-    }
+    let (tx, rx) = mpsc::channel();
+    let script_path = script_path.to_string_lossy().to_string();
+    let phase_clone = phase.to_string();
+    let phase_debug = phase.to_string();
 
-    Ok(())
+    thread::spawn(move || {
+        let output = unsafe {
+            Command::new("/bin/sh")
+                .arg(&script_path)
+                .arg(&phase_clone)
+                .pre_exec(|| {
+                    isolate_child_process()
+                })
+                .output()
+        };
+        let _ = tx.send(output);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(SCRIPT_TIMEOUT_SECS)) {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(SpmError::other(format!(
+                    "{phase_debug} script failed (exit code: {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                )));
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(SpmError::command_failed(format!(
+            "Failed to execute {phase_debug} script: {e}"
+        ))),
+        Err(_) => Err(SpmError::other(format!(
+            "{phase_debug} script timed out after {SCRIPT_TIMEOUT_SECS}s"
+        ))),
+    }
 }
 
 /// Apply security isolation in the child process after fork but before exec.

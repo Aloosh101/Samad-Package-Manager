@@ -151,6 +151,12 @@ impl From<toml::ser::Error> for SpmError {
     }
 }
 
+impl From<tokio::task::JoinError> for SpmError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        SpmError::other(format!("Task join error: {e}"))
+    }
+}
+
 impl From<anyhow::Error> for SpmError {
     fn from(e: anyhow::Error) -> Self {
         SpmError::Other(e.to_string())
@@ -207,8 +213,8 @@ mod tests {
 
     #[test]
     fn test_display_command_failed() {
-        let e = SpmError::command_failed("apt-get not found");
-        assert_eq!(format!("{}", e), "Command failed: apt-get not found");
+        let e = SpmError::command_failed("tool not found");
+        assert_eq!(format!("{}", e), "Command failed: tool not found");
     }
 
     #[test]
@@ -256,8 +262,8 @@ mod tests {
 
     #[test]
     fn test_format_user_error_command_failed() {
-        let e = SpmError::command_failed("apt-get");
-        assert_eq!(e.format_user_error(), "Command failed: apt-get. Is the required tool installed?");
+        let e = SpmError::command_failed("tool");
+        assert_eq!(e.format_user_error(), "Command failed: tool. Is the required tool installed?");
     }
 
     #[test]

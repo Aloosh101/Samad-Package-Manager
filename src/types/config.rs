@@ -24,18 +24,20 @@ impl RepoConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum RepoSource {
-    Apt,
-    Dnf,
+    #[serde(rename = "deb")]
+    Deb,
+    #[serde(rename = "rpm")]
+    Rpm,
+    #[serde(rename = "native")]
     Native,
 }
 
 impl std::fmt::Display for RepoSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RepoSource::Apt => write!(f, "apt"),
-            RepoSource::Dnf => write!(f, "dnf"),
+            RepoSource::Deb => write!(f, "deb"),
+            RepoSource::Rpm => write!(f, "rpm"),
             RepoSource::Native => write!(f, "native"),
         }
     }
@@ -96,4 +98,37 @@ pub struct RepoIndex {
     pub repo_name: String,
     pub format_version: u32,
     pub packages: Vec<RepoIndexRecord>,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_source_deser_deb() {
+        let toml_str = r#"source = "deb""#;
+        #[derive(Deserialize)]
+        struct Wrap { source: RepoSource }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.source, RepoSource::Deb);
+    }
+
+    #[test]
+    fn test_repo_source_deser_rpm() {
+        let toml_str = r#"source = "rpm""#;
+        #[derive(Deserialize)]
+        struct Wrap { source: RepoSource }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.source, RepoSource::Rpm);
+    }
+
+    #[test]
+    fn test_repo_source_deser_native() {
+        let toml_str = r#"source = "native""#;
+        #[derive(Deserialize)]
+        struct Wrap { source: RepoSource }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.source, RepoSource::Native);
+    }
 }

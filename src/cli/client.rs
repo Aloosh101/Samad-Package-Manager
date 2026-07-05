@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use crate::error::{SpmError, SpmResult};
 use serde::Serialize;
@@ -153,25 +154,15 @@ fn try_connect(socket_path: &str) -> Result<UnixStream, std::io::Error> {
         Ok(s) => return Ok(s),
         Err(_) => {}
     }
-    // Daemon not running — try to auto-start it
-    let status = std::process::Command::new("systemctl")
-        .args(["is-active", "spmd"])
-        .output();
-    let needs_start = match status {
-        Ok(out) => !out.status.success(),
-        Err(_) => true,
-    };
-    if needs_start {
-        for &(bin, args) in &[("pkexec", &["systemctl", "start", "spmd"] as &[_]),
-                               ("sudo", &["systemctl", "start", "spmd"] as &[_])] {
-            if let Ok(mut child) = std::process::Command::new(bin).args(args).spawn() {
-                if child.wait().ok().map(|s| s.success()).unwrap_or(false) { break; }
-            }
+    // Daemon not running — try to auto-start it via pidfile check
+    if !Path::new("/run/spmd.pid").exists() {
+        if let Ok(child) = std::process::Command::new("/usr/local/bin/spmd").spawn() {
+            drop(child); // detach
         }
-        for _ in 0..20 {
-            if let Ok(s) = UnixStream::connect(socket_path) { return Ok(s); }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    }
+    for _ in 0..20 {
+        if let Ok(s) = UnixStream::connect(socket_path) { return Ok(s); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     UnixStream::connect(socket_path)
 }

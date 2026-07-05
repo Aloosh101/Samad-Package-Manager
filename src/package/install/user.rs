@@ -36,11 +36,11 @@ pub fn install_for_user(name: &str, user_id: u32, user_home: &str) -> SpmResult<
 
     spinner.message("Downloading and extracting...");
     let result = match repo_config.source {
-        RepoSource::Apt => {
-            crate::package::fetch::fetch_apt_to_temp(name, &repo_name, &repo_config, &raw_dir)
+        RepoSource::Deb => {
+            crate::package::fetch::fetch_deb_to_temp(name, &repo_name, &repo_config, &raw_dir)
         }
-        RepoSource::Dnf => {
-            crate::package::fetch::fetch_dnf_to_temp(name, &repo_name, &repo_config, &raw_dir)
+        RepoSource::Rpm => {
+            crate::package::fetch::fetch_rpm_to_temp(name, &repo_name, &repo_config, &raw_dir)
         }
         RepoSource::Native => {
             crate::package::fetch::fetch_native_to_temp(name, &repo_name, &repo_config, &raw_dir)

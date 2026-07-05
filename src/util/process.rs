@@ -115,26 +115,35 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn find_package_for_file(path: &str) -> Option<String> {
-    // Try dpkg -S first (Debian-based)
-    let dpkg = std::process::Command::new("dpkg")
-        .args(["-S", path])
-        .output()
-        .ok()?;
-
-    if dpkg.status.success() {
-        let stdout = String::from_utf8_lossy(&dpkg.stdout);
-        return stdout.split(':').next().map(|s| s.trim().to_string());
+    // Check dpkg info list files first
+    let info_dir = std::path::Path::new("/var/lib/dpkg/info");
+    if info_dir.is_dir() {
+        for entry in std::fs::read_dir(info_dir).ok()? {
+            let entry = entry.ok()?;
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("list") {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    if content.lines().any(|l| l.trim() == path) {
+                        return p.file_stem().map(|s| s.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
     }
 
-    // Fall back to rpm -qf (RPM-based)
-    let rpm = std::process::Command::new("rpm")
-        .args(["-qf", path])
-        .output()
-        .ok()?;
-
-    if rpm.status.success() {
-        let stdout = String::from_utf8_lossy(&rpm.stdout);
-        return Some(stdout.trim().to_string());
+    // Try RPM sqlite DB
+    if let Ok(conn) = rusqlite::Connection::open("/var/lib/rpm/rpmdb.sqlite") {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT p.name FROM packages p \
+             JOIN files fi ON fi.packageId = p.packageId \
+             WHERE fi.name = ?1 LIMIT 1"
+        ) {
+            if let Ok(rows) = stmt.query_map([path], |row| row.get::<_, String>(0)) {
+                if let Some(pkg) = rows.filter_map(|r| r.ok()).next() {
+                    return Some(pkg);
+                }
+            }
+        }
     }
 
     None

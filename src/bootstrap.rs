@@ -10,7 +10,7 @@ use crate::db;
 use crate::error::{SpmError, SpmResult};
 use crate::types::*;
 
-pub fn init_system(root: Option<&str>, from_system: bool, fix_backend: bool) -> SpmResult<()> {
+pub fn init_system(root: Option<&str>, from_system: bool, _fix_backend: bool) -> SpmResult<()> {
     let target = root.map(Path::new).unwrap_or_else(|| Path::new("/"));
 
     crate::output::section("🚀 Initializing spm system");
@@ -42,7 +42,6 @@ pub fn init_system(root: Option<&str>, from_system: bool, fix_backend: bool) -> 
             paths::packages_dir(),
             paths::sandboxes_dir(),
             paths::scripts_dir(),
-            paths::store_backend_dir(),
             paths::archives_dir(),
             paths::repos_cache_dir(),
             paths::repos_config_dir(),
@@ -70,29 +69,12 @@ pub fn init_system(root: Option<&str>, from_system: bool, fix_backend: bool) -> 
         crate::output::step_info(format!("Database path ready: {}", db_path.display()));
     }
 
-    // Phase 3: Fix/install backends (copy bundled → store)
-    if fix_backend || from_system || root.is_some() {
-        install_backends()?;
-    }
-
-    // Phase 4: Optionally import all system packages
+    // Phase 3: Optionally import all system packages
     if from_system {
         crate::output::step_info("Importing system packages...");
-        let has_dpkg = std::process::Command::new("dpkg")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()
-            .is_some_and(|s| s.success());
-
-        let has_rpm = std::process::Command::new("rpm")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()
-            .is_some_and(|s| s.success());
+        let has_dpkg = Path::new("/var/lib/dpkg/status").exists();
+        let has_rpm = Path::new("/var/lib/rpm/Packages").exists()
+            || Path::new("/var/lib/rpm/rpmdb.sqlite").exists();
 
         let (system_pkgs, pkg_format): (Vec<(String, String)>, PackageFormat) = if has_rpm {
             (query_rpm_packages(), PackageFormat::Rpm)
@@ -131,144 +113,71 @@ pub fn init_system(root: Option<&str>, from_system: bool, fix_backend: bool) -> 
     Ok(())
 }
 
-/// Copy bundled backends to the store directory.
-/// If no bundled backends exist, attempt to copy them from the system (for
-/// initial bootstrap where SPM was installed via the OS package manager).
-fn install_backends() -> SpmResult<()> {
-    // First try: copy from bundled /usr/libexec/spm/backend/
-    match crate::backend::copy_bundled_to_store() {
-        Ok(n) if n > 0 => {
-            crate::output::step_info(format!("Installed {} backends from bundled", n));
-            return Ok(());
-        }
-        Ok(_) => {
-            crate::output::step_warn("No bundled backends found");
-        }
-        Err(e) => {
-            tracing::debug!("Bundled backend copy failed: {e}");
-        }
-    }
-
-    // Second try: copy from system (for transitional bootstrap)
-    let backends = ["apt-get", "apt-cache", "dpkg-deb", "dpkg", "dnf", "rpm", "rpm2cpio", "cpio"];
-    let mut copied = 0;
-
-    for name in &backends {
-        let dst_dir = paths::store_backend_dir().join(name).join("bin");
-        std::fs::create_dir_all(&dst_dir).ok();
-
-        let dst = dst_dir.join(name);
-        if dst.exists() {
-            copied += 1;
-            continue;
-        }
-
-        // Check system PATH (only during transitional bootstrap — will be removed)
-        if let Some(path) = find_on_path(name) {
-            match std::fs::copy(&path, &dst) {
-                Ok(_) => {
-                    #[allow(unused_imports)]
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(meta) = std::fs::metadata(&dst) {
-                        let mut perms = meta.permissions();
-                        perms.set_mode(0o755);
-                        std::fs::set_permissions(&dst, perms).ok();
-                    }
-                    copied += 1;
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to copy '{}' from system: {e}", name);
-                }
-            }
-        }
-    }
-
-    if copied > 0 {
-        crate::output::step_info(format!("Copied {} backends from system", copied));
-    } else {
-        crate::output::step_warn(
-            "No backends could be installed. SPM will have limited functionality.\n\
-             Install spm-backends package or ensure /usr/libexec/spm/backend/ exists."
-        );
-    }
-
-    Ok(())
-}
-
-/// Search PATH and common system directories for a binary.
-/// Used only during transitional bootstrap to populate the backend store.
-fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
-    // First check PATH
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Try common locations directly
-    for dir in &["/usr/bin", "/usr/sbin", "/bin", "/usr/lib/cpio"] {
-        let candidate = std::path::PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn query_dpkg_packages() -> Vec<(String, String)> {
-    let output = std::process::Command::new("dpkg")
-        .args(["--get-selections"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+    // Read /var/lib/dpkg/status directly
+    let path = std::path::Path::new("/var/lib/dpkg/status");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut packages = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1] == "install" {
-            let name = parts[0].to_string();
-            let ver_output = std::process::Command::new("dpkg")
-                .args(["-s", &name])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output();
-            if let Ok(o) = ver_output {
-                let info = String::from_utf8_lossy(&o.stdout);
-                if let Some(ver_line) = info.lines().find(|l| l.starts_with("Version: ")) {
-                    let version = ver_line.trim_start_matches("Version: ").to_string();
+    let mut current_name: Option<String> = None;
+    let mut current_version: Option<String> = None;
+    let mut status_install = false;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            if let (Some(name), Some(version)) = (current_name.take(), current_version.take()) {
+                if status_install {
                     packages.push((name, version));
                 }
             }
+            current_version = None;
+            status_install = false;
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("Package: ") {
+            current_name = Some(val.trim().to_string());
+        }
+        if let Some(val) = line.strip_prefix("Version: ") {
+            current_version = Some(val.trim().to_string());
+        }
+        if line.starts_with("Status: ") && line.contains("installed") {
+            status_install = true;
+        }
+    }
+    if let (Some(name), Some(version)) = (current_name, current_version) {
+        if status_install {
+            packages.push((name, version));
         }
     }
     packages
 }
 
 fn query_rpm_packages() -> Vec<(String, String)> {
-    let output = std::process::Command::new("rpm")
-        .args(["-qa", "--queryformat", "%{NAME} %{VERSION}-%{RELEASE}\n"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut packages = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            packages.push((parts[0].to_string(), parts[1].to_string()));
+    // Try reading RPM sqlite database (modern Fedora)
+    let sqlite_path = std::path::Path::new("/var/lib/rpm/rpmdb.sqlite");
+    if sqlite_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(sqlite_path) {
+            if let Ok(mut stmt) = conn.prepare("SELECT name, version || '-' || release FROM packages") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                }) {
+                    let pkgs: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+                    if !pkgs.is_empty() {
+                        return pkgs;
+                    }
+                }
+            }
         }
     }
-    packages
+    Vec::new()
 }
 
 /// Install the spmd systemd service unit for daemon-based operations.

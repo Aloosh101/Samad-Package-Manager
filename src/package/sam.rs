@@ -162,7 +162,7 @@ pub fn calculate_data_hash(path: &str) -> SpmResult<String> {
     Ok(hash::hash_bytes(&content))
 }
 
-/// Scan a .sam file for ELF SONAMEs using `readelf -d`.
+/// Scan a .sam file for ELF SONAMEs using pure Rust ELF parsing.
 /// Returns deduplicated SONAME strings found in the package's ELF files.
 pub fn scan_sam_sonames(path: &str) -> Vec<String> {
     let dir = std::env::temp_dir().join(format!("spm-elf-scan-{}", std::process::id()));
@@ -183,24 +183,23 @@ pub fn scan_sam_sonames(path: &str) -> Vec<String> {
             if &magic != b"\x7fELF" {
                 continue;
             }
-            // Run readelf -d to extract SONAME
-            if let Ok(output) = std::process::Command::new("readelf")
-                .args(["-d", &fpath.to_string_lossy()])
-                .output()
-            {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        let line = line.trim();
-                        // "0x0000... (SONAME) Library soname: [libfoo.so.1]"
-                        if let Some(rest) = line.strip_prefix("0x") {
-                            if rest.contains("SONAME") {
-                                if let Some(start) = rest.find('[') {
-                                    if let Some(end) = rest[start..].find(']') {
-                                        let soname = &rest[start+1..start+end];
-                                        if !sonames.contains(&soname.to_string()) {
-                                            sonames.push(soname.to_string());
-                                        }
+            // Use goblin to extract SONAME from ELF dynamic section
+            let bytes = match fs::read(&fpath) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(binary) = goblin::elf::Elf::parse(&bytes) {
+                if let Some(dynamic) = &binary.dynamic {
+                    let strtab_offset = dynamic.info.strtab;
+                    if strtab_offset > 0 && strtab_offset < bytes.len() {
+                        let strtab_bytes = &bytes[strtab_offset..];
+                        let strtab = goblin::strtab::Strtab::new(strtab_bytes, 0x0);
+                        for entry in &dynamic.dyns {
+                            if entry.d_tag == goblin::elf::dynamic::DT_SONAME {
+                                if let Some(soname) = strtab.get_at(entry.d_val as usize) {
+                                    let soname = soname.to_string();
+                                    if !sonames.contains(&soname) {
+                                        sonames.push(soname);
                                     }
                                 }
                             }

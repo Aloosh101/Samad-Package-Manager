@@ -3,6 +3,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+
+use reqwest::blocking::Client;
+
 use crate::error::{SpmError, SpmResult};
 
 pub(crate) fn run_with_progress(
@@ -181,6 +184,91 @@ pub(crate) fn find_deb_in_cache(cache_dir: &str, name: &str) -> SpmResult<String
     Err(SpmError::other(format!(
         "Deb package for '{name}' not found in cache"
     )))
+}
+
+pub fn download_with_progress(url: &str, dest: &Path, total_size: Option<u64>) -> SpmResult<()> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| SpmError::network(format!("Failed to create HTTP client: {e}")))?;
+
+    let existing_size = if dest.exists() {
+        fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let request = client.get(url);
+    let response = if existing_size > 0 {
+        request
+            .header("Range", &format!("bytes={existing_size}-"))
+            .send()
+    } else {
+        request.send()
+    }
+    .map_err(|e| SpmError::network(format!("Failed to download {url}: {e}")))?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let _ = fs::remove_file(dest);
+        return download_with_progress(url, dest, total_size);
+    }
+
+    let total = total_size.or_else(|| {
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+
+    let mut file = if status == reqwest::StatusCode::PARTIAL_CONTENT && existing_size > 0 {
+        fs::OpenOptions::new().append(true).open(dest)?
+    } else {
+        if existing_size > 0 {
+            let _ = fs::remove_file(dest);
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::File::create(dest)?
+    };
+
+    let label = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| url.to_string());
+    let mut pb =
+        crate::output::ProgressBar::with_total(format!("Downloading {label}"), total.unwrap_or(0));
+
+    let body = response
+        .bytes()
+        .map_err(|e| SpmError::network(format!("Failed to read response: {e}")))?;
+    file.write_all(&body)?;
+    pb.tick_by(body.len() as u64);
+    pb.update();
+    pb.finish(&label);
+
+    Ok(())
+}
+
+pub fn download_bytes(url: &str) -> SpmResult<Vec<u8>> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| SpmError::network(format!("Failed to create HTTP client: {e}")))?;
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| SpmError::network(format!("Failed to fetch {url}: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(SpmError::network(format!("HTTP {status} fetching {url}")));
+    }
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| SpmError::network(format!("Failed to read response body from {url}: {e}")))
 }
 
 #[cfg(test)]

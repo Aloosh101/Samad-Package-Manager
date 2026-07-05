@@ -64,7 +64,7 @@ impl SpmConfig {
                 })?);
             }
             "preferred_source" => {
-                let valid = ["apt", "dnf", "native"];
+                let valid = ["deb", "rpm", "native"];
                 if !valid.contains(&value) {
                     return Err(SpmError::config(format!(
                         "preferred_source must be one of: {}, got: {}", valid.join(", "), value

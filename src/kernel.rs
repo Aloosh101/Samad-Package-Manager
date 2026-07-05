@@ -93,6 +93,7 @@ pub fn is_kernel_package(name: &str) -> bool {
 
 /// Rebuild DKMS modules for all installed kernels
 pub fn rebuild_dkms() {
+    // distro integration hook — replace with pure Rust when needed
     let output = match Command::new("dkms").arg("status").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => {
@@ -118,6 +119,7 @@ pub fn rebuild_dkms() {
 
 /// Regenerate initramfs for a specific kernel version (or all if version is None)
 pub fn regenerate_initramfs(version: Option<&str>) {
+    // distro integration hooks — replace with pure Rust when needed
     if let Some(ver) = version {
         // Regenerate for a specific kernel
         if Command::new("dracut").arg("--version").output().is_ok() {
@@ -149,6 +151,7 @@ pub fn regenerate_initramfs(version: Option<&str>) {
 
 /// Update bootloader configuration
 pub fn update_bootloader() {
+    // distro integration hooks — replace with pure Rust when needed
     // Try systemd-boot first, then GRUB
     if Path::new("/boot/efi/EFI/systemd").exists() || Path::new("/boot/efi/loader/loader.conf").exists() {
         tracing::debug!("Updating systemd-boot");
@@ -222,6 +225,7 @@ pub fn handle_kernel_remove(package_name: &str) {
 pub fn detect_gpu() -> SpmResult<Vec<GpuDevice>> {
     let mut gpus = Vec::new();
 
+    // distro integration hook — replace with /sys/bus/pci/devices parsing when possible
     let output = Command::new("lspci")
         .args(["-nn", "-d", "::0300"])
         .output()
@@ -256,6 +260,7 @@ pub fn detect_gpu() -> SpmResult<Vec<GpuDevice>> {
 }
 
 fn detect_gpu_driver(vendor: &GpuVendor) -> GpuDriver {
+    // distro integration hooks — replace with /proc/modules parsing when possible
     match vendor {
         GpuVendor::Nvidia => {
             if let Ok(o) = Command::new("lsmod").output() {

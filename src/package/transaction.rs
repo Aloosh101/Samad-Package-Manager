@@ -400,8 +400,8 @@ impl<'a> TransactionEngine<'a> {
             ));
 
             let matching_source = match pid.format {
-                PackageFormat::Deb => RepoSource::Apt,
-                PackageFormat::Rpm => RepoSource::Dnf,
+                PackageFormat::Deb => RepoSource::Deb,
+                PackageFormat::Rpm => RepoSource::Rpm,
                 PackageFormat::Sam => RepoSource::Native,
             };
 

@@ -192,17 +192,20 @@ pub(crate) fn fetch_gz_to_string(base_url: &str, path: &str) -> SpmResult<String
         format!("{}/{}", base_url, path)
     };
 
-    let mut response = ureq::get(&url)
-        .call()
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|e| SpmError::network(format!("Failed to create HTTP client: {e}")))?;
+    let response = client
+        .get(&url)
+        .send()
         .map_err(|e| SpmError::network(format!("Failed to fetch {url}: {e}")))?;
-
     let max_size: u64 = 64 * 1024 * 1024;
     let body = response
-        .body_mut()
-        .with_config()
-        .limit(max_size)
-        .read_to_vec()
+        .bytes()
         .map_err(|e| SpmError::network(format!("Failed to read {url}: {e}")))?;
+    if body.len() as u64 > max_size {
+        return Err(SpmError::network(format!("Response too large for {url}")));
+    }
 
     let mut decoder = flate2::read::GzDecoder::new(&body[..]);
     let mut text = String::new();
@@ -222,17 +225,21 @@ pub(crate) fn fetch_file_to_vec(base_url: &str, path: &str) -> SpmResult<Vec<u8>
         format!("{}/{}", base_url, path)
     };
 
-    let mut response = ureq::get(&url)
-        .call()
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|e| SpmError::network(format!("Failed to create HTTP client: {e}")))?;
+    let response = client
+        .get(&url)
+        .send()
         .map_err(|e| SpmError::network(format!("Failed to fetch {url}: {e}")))?;
-
     let max_size: u64 = 512 * 1024 * 1024;
-    response
-        .body_mut()
-        .with_config()
-        .limit(max_size)
-        .read_to_vec()
-        .map_err(|e| SpmError::network(format!("Failed to read {url}: {e}")))
+    let body = response
+        .bytes()
+        .map_err(|e| SpmError::network(format!("Failed to read {url}: {e}")))?;
+    if body.len() as u64 > max_size {
+        return Err(SpmError::network(format!("Response too large for {url}")));
+    }
+    Ok(body.to_vec())
 }
 
 /// Verify a SHA256 checksum.
@@ -255,15 +262,20 @@ pub(crate) fn download_rpm_from_repo(
 ) -> SpmResult<Vec<u8>> {
     // Step 1: Fetch repomd.xml
     let repomd_url = format!("{}/repodata/repomd.xml", repo_base_url.trim_end_matches('/'));
-    let mut repomd_resp = ureq::get(&repomd_url)
-        .call()
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|e| SpmError::network(format!("Failed to create HTTP client: {e}")))?;
+    let repomd_resp = client
+        .get(&repomd_url)
+        .send()
         .map_err(|e| SpmError::network(format!("Failed to fetch repomd.xml: {e}")))?;
+    let max_size: u64 = 16 * 1024 * 1024;
     let repomd_body = repomd_resp
-        .body_mut()
-        .with_config()
-        .limit(16 * 1024 * 1024)
-        .read_to_vec()
+        .bytes()
         .map_err(|e| SpmError::network(format!("Failed to read repomd.xml: {e}")))?;
+    if repomd_body.len() as u64 > max_size {
+        return Err(SpmError::network(format!("repomd.xml too large")));
+    }
 
     let repomd_text = String::from_utf8_lossy(&repomd_body);
 

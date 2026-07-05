@@ -114,12 +114,12 @@ pub fn build_index() -> SpmResult<()> {
     let repos = crate::config::repos::load_repos()?;
     for (repo_name, config) in &repos {
         match config.source {
-            RepoSource::Apt => {
+            RepoSource::Deb => {
                 if let Err(e) = deb::update_index(&mut index, repo_name, config) {
                     tracing::warn!("Failed to build SONAME index for apt repo '{}': {}", repo_name, e);
                 }
             }
-            RepoSource::Dnf => {
+            RepoSource::Rpm => {
                 if let Err(e) = rpm::update_index(&mut index, repo_name, config) {
                     tracing::warn!("Failed to build SONAME index for dnf repo '{}': {}", repo_name, e);
                 }

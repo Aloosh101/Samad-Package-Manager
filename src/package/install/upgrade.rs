@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::process::Command;
 
 use crate::config::repos;
 use crate::db;
@@ -121,8 +120,8 @@ enum UpgradeResult {
 
 fn format_to_source(format: &PackageFormat) -> RepoSource {
     match format {
-        PackageFormat::Deb => RepoSource::Apt,
-        PackageFormat::Rpm => RepoSource::Dnf,
+        PackageFormat::Deb => RepoSource::Deb,
+        PackageFormat::Rpm => RepoSource::Rpm,
         PackageFormat::Sam => RepoSource::Native,
     }
 }
@@ -148,30 +147,67 @@ fn check_upgrade(pkg: &InstalledPackage, repos: &[(String, RepoConfig)]) -> SpmR
             continue;
         }
         let available_ver: Option<String> = match rc.source {
-            RepoSource::Apt => {
-                let output = Command::new(crate::util::backend::resolve("apt-cache"))
-                    .args(["show", &pkg.name])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .find_map(|l| l.strip_prefix("Version: "))
-                            .map(|v| v.to_string())
+            RepoSource::Deb => {
+                // Read from cached Packages files (from spm update)
+                let deb_cache = crate::config::paths::repos_cache_dir().join("deb").join(_rn);
+                if !deb_cache.exists() {
+                    None
+                } else if let Ok(entries) = std::fs::read_dir(&deb_cache) {
+                    let mut apt_version: Option<String> = None;
+                    for entry in entries.flatten() {
+                        if apt_version.is_some() {
+                            break;
+                        }
+                        let p = entry.path();
+                        if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                            if !fname.starts_with("Packages-") {
+                                continue;
+                            }
+                            if let Ok(text) = std::fs::read_to_string(&p) {
+                                let mut in_pkg = false;
+                                let mut version: Option<String> = None;
+                                for line in text.lines() {
+                                    if line.is_empty() {
+                                        if in_pkg {
+                                            apt_version = version.take();
+                                            break;
+                                        }
+                                        in_pkg = false;
+                                        continue;
+                                    }
+                                    if let Some(val) = line.strip_prefix("Package: ") {
+                                        in_pkg = val.trim().eq_ignore_ascii_case(&pkg.name);
+                                    }
+                                    if in_pkg {
+                                        if let Some(val) = line.strip_prefix("Version: ") {
+                                            version = Some(val.trim().to_string());
+                                        }
+                                    }
+                                }
+                                if in_pkg {
+                                    apt_version = version.take();
+                                }
+                            }
+                        }
                     }
-                    _ => None,
+                    apt_version
+                } else {
+                    None
                 }
             }
-            RepoSource::Dnf => {
-                let output = Command::new(crate::util::backend::resolve("dnf"))
-                    .args(["repoquery", "--queryformat", "%{VERSION}", &pkg.name])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if v.is_empty() { None } else { Some(v) }
+            RepoSource::Rpm => {
+                // Read from SONAME index
+                if let Ok(index) = crate::index::SonameIndex::load() {
+                    if let Some(providers) = index.get_providers(&pkg.name) {
+                        providers.iter()
+                            .filter(|p| p.source == RepoSource::Rpm)
+                            .map(|p| p.version.clone())
+                            .next()
+                    } else {
+                        None
                     }
-                    _ => None,
+                } else {
+                    None
                 }
             }
             RepoSource::Native => {
@@ -230,12 +266,12 @@ mod tests {
 
     #[test]
     fn test_format_to_source_deb() {
-        assert_eq!(format_to_source(&PackageFormat::Deb), RepoSource::Apt);
+        assert_eq!(format_to_source(&PackageFormat::Deb), RepoSource::Deb);
     }
 
     #[test]
     fn test_format_to_source_rpm() {
-        assert_eq!(format_to_source(&PackageFormat::Rpm), RepoSource::Dnf);
+        assert_eq!(format_to_source(&PackageFormat::Rpm), RepoSource::Rpm);
     }
 
     #[test]

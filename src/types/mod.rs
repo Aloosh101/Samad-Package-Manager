@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_repo_config_serialize() {
         let rc = RepoConfig {
-            source: RepoSource::Apt,
+            source: RepoSource::Deb,
             distro: Some("ubuntu".into()),
             codename: Some("noble".into()),
             components: Some(vec!["main".into(), "universe".into()]),
@@ -157,7 +157,7 @@ mod tests {
         };
         let json = serde_json::to_string(&rc).unwrap();
         let deserialized: RepoConfig = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized.source, RepoSource::Apt));
+        assert!(matches!(deserialized.source, RepoSource::Deb));
         assert_eq!(deserialized.components.unwrap().len(), 2);
     }
 

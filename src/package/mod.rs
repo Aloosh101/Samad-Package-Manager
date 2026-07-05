@@ -1,11 +1,13 @@
 pub mod build;
 pub mod cleanup;
 pub mod deb;
+pub mod extract;
 pub mod fetch;
 pub mod hooks;
 pub mod install;
 pub mod query;
 pub mod resolver;
+pub mod sandbox;
 pub mod solver;
 pub mod rpm;
 pub mod sam;

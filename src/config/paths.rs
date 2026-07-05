@@ -101,10 +101,6 @@ pub fn triggers_dir() -> PathBuf {
     db_base().join("triggers")
 }
 
-pub fn store_backend_dir() -> PathBuf {
-    db_base().join("store").join("backend")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,6 +12,13 @@ use tokio::net::UnixListener;
 use crate::db;
 use crate::error::{SpmError, SpmResult};
 
+pub mod conflict;
+pub mod ipc;
+pub mod monitor;
+pub mod permission;
+pub mod store;
+pub mod transaction;
+
 pub fn socket_path() -> String {
     match std::env::var("SPM_ROOT") {
         Ok(root) if !root.is_empty() => format!("{}/run/spm.sock", root.trim_end_matches('/')),
@@ -328,7 +335,7 @@ async fn handle_system_install(
 
     let name = package.to_string();
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
-        crate::package::install::install_package(&name, None, false, true, Default::default())
+        crate::package::install::install_package(&name, None, false, true, false, Default::default())
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Install failed: {e}")))?;
@@ -477,6 +484,10 @@ fn peer_cred(stream: &UnixStream) -> SpmResult<(u32, u32)> {
 }
 
 fn is_authorized(uid: u32) -> bool {
+    // Allow all operations when SPM_NO_AUTH is set (testing/dev mode)
+    if std::env::var("SPM_NO_AUTH").as_deref() == Ok("1") {
+        return true;
+    }
     if uid == 0 {
         return true;
     }
@@ -589,8 +600,8 @@ async fn handle_repo(req: &DaemonRequest) -> Result<String, SpmError> {
             let name = detail["name"].as_str().ok_or_else(|| SpmError::other("Missing 'name'"))?;
             let source_str = detail["source"].as_str().unwrap_or("native");
             let source = match source_str {
-                "apt" => crate::types::RepoSource::Apt,
-                "dnf" => crate::types::RepoSource::Dnf,
+                "deb" => crate::types::RepoSource::Deb,
+                "rpm" => crate::types::RepoSource::Rpm,
                 "native" => crate::types::RepoSource::Native,
                 _ => return Err(SpmError::other(format!("Invalid repo source '{source_str}'"))),
             };

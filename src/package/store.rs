@@ -1,10 +1,10 @@
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use crate::config::paths;
 use crate::error::{SpmError, SpmResult};
+use crate::integration;
 use crate::types::PackageFormat;
 
 /// Map a PackageFormat to its store origin subdirectory name.
@@ -16,25 +16,13 @@ pub fn origin_from_format(format: &PackageFormat) -> &'static str {
     }
 }
 
-/// Detect the host system's native package format by checking which
-/// package manager backend is available.  "Sam" is always the fallback.
+/// Detect the host system's native package format by checking for
+/// well-known database paths.  "Sam" is always the fallback.
 pub fn detect_host_format() -> PackageFormat {
-    if std::process::Command::new("dpkg")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .is_some_and(|s| s.success())
-    {
+    if std::path::Path::new("/var/lib/dpkg/status").exists() {
         PackageFormat::Deb
-    } else if std::process::Command::new("rpm")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .is_some_and(|s| s.success())
+    } else if std::path::Path::new("/var/lib/rpm/Packages").exists()
+        || std::path::Path::new("/var/lib/rpm/rpmdb.sqlite").exists()
     {
         PackageFormat::Rpm
     } else {
@@ -262,19 +250,8 @@ pub fn set_rpath_on_elfs(
     }
 
     for elf in &elfs {
-        let output = Command::new("patchelf")
-            .arg("--set-rpath")
-            .arg(&rpath_val)
-            .arg("--")
-            .arg(elf)
-            .output()
-            .map_err(|e| SpmError::command_failed(
-                format!("patchelf failed for {}: {e}", elf.display())
-            ))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("patchelf could not set RPATH for {}: {stderr}", elf.display());
+        if let Err(e) = integration::elf::set_rpath(elf, &rpath_val) {
+            tracing::warn!("Failed to set RPATH for {}: {e}", elf.display());
         }
     }
 

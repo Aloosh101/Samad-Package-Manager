@@ -1,13 +1,14 @@
+pub(crate) mod debian;
 pub(crate) mod download;
 pub(crate) mod gs;
+pub(crate) mod rpm;
 pub(crate) mod scan;
+pub(crate) mod verify;
 
 use std::collections::HashMap;
 use chrono::Utc;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::config::paths;
 use crate::error::{SpmError, SpmResult};
@@ -35,8 +36,8 @@ pub(crate) fn fetch_and_extract(name: &str, repo_name: &str, repo_config: &RepoC
     let tmp_dir = tmp_dir_obj.path().to_string_lossy().to_string();
 
     let result = match repo_config.source {
-        RepoSource::Apt => fetch_apt_to_temp(name, repo_name, repo_config, &tmp_dir),
-        RepoSource::Dnf => fetch_dnf_to_temp(name, repo_name, repo_config, &tmp_dir),
+        RepoSource::Deb => fetch_deb_to_temp(name, repo_name, repo_config, &tmp_dir),
+        RepoSource::Rpm => fetch_rpm_to_temp(name, repo_name, repo_config, &tmp_dir),
         RepoSource::Native => fetch_native_to_temp(name, repo_name, repo_config, &tmp_dir),
     };
 
@@ -93,150 +94,7 @@ pub(crate) fn fetch_and_extract(name: &str, repo_name: &str, repo_config: &RepoC
     Ok(fetched)
 }
 
-pub(crate) fn fetch_cross_format_fallback(name: &str, tmp_dir: &str) -> SpmResult<FetchedPackage> {
-    let apt_output = Command::new(crate::util::backend::resolve("apt-get"))
-        .args(["download", name, "--quiet"])
-        .current_dir(tmp_dir)
-        .output();
-
-    if let Ok(output) = apt_output {
-        if output.status.success() {
-            if let Ok(entries) = fs::read_dir(tmp_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("deb") {
-                        let extract_dir = format!("{}/root", tmp_dir);
-                        fs::create_dir_all(&extract_dir)?;
-                        super::deb::extract_deb(&p.to_string_lossy(), &extract_dir)?;
-
-                        let version = match super::deb::parse_deb_control(&p.to_string_lossy()) {
-                            Ok(pkg) => pkg.version,
-                            Err(_) => "unknown".into(),
-                        };
-
-                        let manifest = Manifest {
-                            name: name.to_string(),
-                            version: version.clone(),
-                            format_version: 1,
-                            source: Some(PackageSource {
-                                original_format: "deb".to_string(),
-                                original_package: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-                                repo: "cross-format-fallback".to_string(),
-                                hash_original: String::new(),
-                            }),
-                            ..Default::default()
-                        };
-
-                        let pkg = InstalledPackage {
-                            name: name.to_string(),
-                            version,
-                            format: PackageFormat::Sam,
-                            install_type: InstallType::Native,
-                            manifest: Some(serde_json::to_string(&manifest).unwrap_or_default()),
-                            install_date: Utc::now().to_rfc3339(),
-                            source_repo: Some("cross-format (deb)".to_string()),
-                            store_hash: None,
-                            origin: InstallOrigin::Spm,
-                        };
-
-                        return Ok(FetchedPackage {
-                            extracted_dir: extract_dir,
-                            files: Vec::new(),
-                            manifest,
-                            pkg,
-                            conflicting_packages: Vec::new(),
-                            scripts: super::scripts::Scripts::default(),
-                            _tmp_dir: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    let dnf_output = Command::new(crate::util::backend::resolve("dnf"))
-        .args(["download", "--destdir", tmp_dir, name])
-        .stderr(Stdio::null())
-        .output();
-
-    if let Ok(output) = dnf_output {
-        if output.status.success() {
-            if let Ok(entries) = fs::read_dir(tmp_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                        if p.extension().and_then(|e| e.to_str()) == Some("rpm") {
-                            let extract_dir = format!("{}/root", tmp_dir);
-                            fs::create_dir_all(&extract_dir)?;
-                            let extract_output = Command::new(crate::util::backend::resolve("rpm2cpio"))
-                                .arg(&p)
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .output()
-                                .map_err(|e| SpmError::command_failed(format!("rpm2cpio failed: {e}")))?;
-                            if !extract_output.status.success() {
-                                return Err(SpmError::command_failed("rpm2cpio extraction failed"));
-                            }
-                            let mut cpio = Command::new(crate::util::backend::resolve("cpio"))
-                                .args(["-idmv", "-D", &extract_dir])
-                                .stdin(Stdio::piped())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .spawn()
-                                .map_err(|e| SpmError::command_failed(format!("Failed to spawn cpio: {e}")))?;
-                            if let Some(mut stdin) = cpio.stdin.take() {
-                                stdin.write_all(&extract_output.stdout)?;
-                            }
-                            let cpio_status = cpio.wait_with_output()
-                                .map_err(|e| SpmError::command_failed(format!("cpio failed: {e}")))?;
-                            if !cpio_status.status.success() {
-                                return Err(SpmError::command_failed("cpio extraction failed"));
-                            }
-
-                        let version = match super::rpm::parse_rpm_header(&p.to_string_lossy()) {
-                            Ok(pkg) => pkg.version,
-                            Err(_) => "unknown".into(),
-                        };
-
-                        let manifest = Manifest {
-                            name: name.to_string(),
-                            version: version.clone(),
-                            format_version: 1,
-                            source: Some(PackageSource {
-                                original_format: "rpm".to_string(),
-                                original_package: p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-                                repo: "cross-format-fallback".to_string(),
-                                hash_original: String::new(),
-                            }),
-                            ..Default::default()
-                        };
-
-                        let pkg = InstalledPackage {
-                            name: name.to_string(),
-                            version,
-                            format: PackageFormat::Sam,
-                            install_type: InstallType::Native,
-                            manifest: Some(serde_json::to_string(&manifest).unwrap_or_default()),
-                            install_date: Utc::now().to_rfc3339(),
-                            source_repo: Some("cross-format (rpm)".to_string()),
-                            store_hash: None,
-                            origin: InstallOrigin::Spm,
-                        };
-
-                        return Ok(FetchedPackage {
-                            extracted_dir: extract_dir,
-                            files: Vec::new(),
-                            manifest,
-                            pkg,
-                            conflicting_packages: Vec::new(),
-                            scripts: super::scripts::Scripts::default(),
-                            _tmp_dir: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
+pub(crate) fn fetch_cross_format_fallback(name: &str, _tmp_dir: &str) -> SpmResult<FetchedPackage> {
     Err(SpmError::package_not_found(format!(
         "Cross-format fallback: '{name}' not found in any format"
     )))
@@ -298,103 +156,98 @@ fn host_arch() -> String {
     }.to_string()
 }
 
-pub(crate) fn fetch_apt_to_temp(
+pub(crate) fn fetch_deb_to_temp(
     name: &str,
     repo_name: &str,
     config: &RepoConfig,
     tmp_dir: &str,
 ) -> SpmResult<FetchedPackage> {
+    // Primary path: use locally cached Packages file to find the .deb URL
+    // (much faster — no need to re-download 56MB Packages.gz per package)
     if config.mirrors.is_some() {
-        let http_result = fetch_apt_http_to_temp(name, repo_name, config, tmp_dir);
-        if http_result.is_ok() {
-            return http_result;
+        if let Ok(fetched) = fetch_deb_http_to_temp(name, repo_name, config, tmp_dir) {
+            return Ok(fetched);
         }
     }
-    fetch_apt_get_to_temp(name, repo_name, config, tmp_dir)
+    // Fallback: download Packages.gz live from mirror and parse
+    if let (Some(mirrors), Some(codename), Some(components)) =
+        (&config.mirrors, &config.codename, &config.components)
+    {
+        let mirror = mirrors[0].trim_end_matches('/');
+        for component in components {
+            match debian::fetch_debian_package(name, None, mirror, codename, component) {
+                Ok(deb_bytes) => {
+                    let archive_name = format!("{}.deb", name);
+                    let deb_path = std::path::Path::new(tmp_dir).join(&archive_name);
+                    std::fs::write(&deb_path, &deb_bytes)?;
+
+                    let extracted_dir = format!("{}/root", tmp_dir);
+                    super::deb::extract_deb(
+                        &deb_path.to_string_lossy(),
+                        &extracted_dir,
+                    )?;
+
+                    let scripts_dir = format!("{}/scripts", tmp_dir);
+                    let scripts = super::scripts::extract_deb_scripts(
+                        &deb_path.to_string_lossy(),
+                        &scripts_dir,
+                    )?;
+
+                    let version = match super::deb::parse_deb_control(&deb_path.to_string_lossy()) {
+                        Ok(pkg) => pkg.version,
+                        Err(_) => "unknown".into(),
+                    };
+
+                    return Ok(FetchedPackage {
+                        extracted_dir,
+                        files: Vec::new(),
+                        manifest: Manifest {
+                            name: name.to_string(),
+                            version: version.clone(),
+                            ..Manifest::default()
+                        },
+                        pkg: InstalledPackage {
+                            name: name.to_string(),
+                            version,
+                            format: PackageFormat::Deb,
+                            install_type: InstallType::Native,
+                            manifest: None,
+                            install_date: Utc::now().to_rfc3339(),
+                            source_repo: Some(format!("deb-http:{}", repo_name)),
+                            store_hash: None,
+                            origin: InstallOrigin::Spm,
+                        },
+                        conflicting_packages: Vec::new(),
+                        scripts,
+                        _tmp_dir: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Pure Rust Debian fetch failed for '{}' from {}: {}. Trying next component.",
+                        name,
+                        mirror,
+                        e
+                    );
+                }
+            }
+        }
+    }
+    fetch_deb_get_to_temp(name, repo_name, config, tmp_dir)
 }
 
-fn fetch_apt_get_to_temp(
+fn fetch_deb_get_to_temp(
     name: &str,
     _repo_name: &str,
     _config: &RepoConfig,
-    tmp_dir: &str,
+    _tmp_dir: &str,
 ) -> SpmResult<FetchedPackage> {
-    let cache_dir = paths::archives_dir();
-    fs::create_dir_all(&cache_dir)?;
-
-    let output = download::run_with_progress(
-        Command::new(crate::util::backend::resolve("apt-cache"))
-            .args(["show", name]),
-        &format!("🔍 Searching for '{name}' in apt repositories"),
-    ).map_err(|e| SpmError::command_failed(format!("Failed to run apt-cache: {e}. Is apt available?")))?;
-
-    if !output.status.success() {
-        return Err(SpmError::package_not_found(format!(
-            "Package '{name}' not found in apt repositories"
-        )));
-    }
-
-    let info = String::from_utf8_lossy(&output.stdout);
-    let mut version = String::new();
-    let mut _arch = String::new();
-
-    for line in info.lines() {
-        if let Some(v) = line.strip_prefix("Version: ") {
-            version = v.trim().to_string();
-        }
-        if let Some(a) = line.strip_prefix("Architecture: ") {
-            _arch = a.trim().to_string();
-        }
-    }
-
-    let download_output = Command::new(crate::util::backend::resolve("apt-get"))
-        .args(["download", name, "--quiet"])
-        .current_dir(&cache_dir)
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("apt-get download failed: {e}")))?;
-
-    if !download_output.status.success() {
-        let stderr = String::from_utf8_lossy(&download_output.stderr);
-        return Err(SpmError::other(format!("apt-get could not download '{name}': {stderr}")));
-    }
-
-    let deb_path = download::find_deb_in_cache(cache_dir.to_string_lossy().as_ref(), name)
-        .map_err(|_| SpmError::other(format!(
-            "apt-get downloaded '{name}' but no .deb file found in cache"
-        )))?;
-
-    let extracted_dir = format!("{}/root", tmp_dir);
-    super::deb::extract_deb(&deb_path, &extracted_dir)?;
-
-    let scripts_dir = format!("{}/scripts", tmp_dir);
-    let scripts = super::scripts::extract_deb_scripts(&deb_path, &scripts_dir)?;
-
-    Ok(FetchedPackage {
-        extracted_dir,
-        files: Vec::new(),
-        manifest: Manifest {
-            name: name.to_string(),
-            version: version.clone(),
-            ..Manifest::default()
-        },
-        pkg: InstalledPackage {
-            name: name.to_string(),
-            version,
-            format: PackageFormat::Deb,
-            install_type: InstallType::Native,
-            manifest: None,
-            install_date: Utc::now().to_rfc3339(),
-            source_repo: Some("apt".to_string()),
-            store_hash: None,
-            origin: InstallOrigin::Spm,
-        },
-        conflicting_packages: Vec::new(),
-        scripts,
-        _tmp_dir: None,
-    })
+    Err(SpmError::package_not_found(format!(
+        "Package '{name}' not found in deb repositories via HTTP fetch"
+    )))
 }
 
-fn fetch_apt_http_to_temp(
+fn fetch_deb_http_to_temp(
     name: &str,
     repo_name: &str,
     config: &RepoConfig,
@@ -405,7 +258,7 @@ fn fetch_apt_http_to_temp(
     let mut filename = String::new();
     let mut sha256 = None;
 
-    let cache_base = crate::config::paths::repos_cache_dir().join("apt").join(repo_name);
+    let cache_base = crate::config::paths::repos_cache_dir().join("deb").join(repo_name);
 
     for arch in &arches {
         if let Some(components) = &config.components {
@@ -417,9 +270,12 @@ fn fetch_apt_http_to_temp(
                 );
                 let cache_path = cache_base.join(&cache_name);
                 if !cache_path.exists() {
+                    tracing::debug!("fetch_apt_http: cache file not found: {:?}", cache_path);
                     continue;
                 }
+                tracing::debug!("fetch_apt_http: reading cache file: {:?}", cache_path);
                 if let Ok(text) = fs::read_to_string(&cache_path) {
+                    tracing::debug!("fetch_apt_http: read {} bytes, looking for '{}'", text.len(), name);
                     if let Some(entry) = parse_deb822_entry(&text, name) {
                         if let Some(v) = entry.get("Version") {
                             version = v.clone();
@@ -510,7 +366,7 @@ fn fetch_apt_http_to_temp(
             install_type: InstallType::Native,
             manifest: None,
             install_date: Utc::now().to_rfc3339(),
-            source_repo: Some(format!("apt-http:{}", repo_name)),
+            source_repo: Some(format!("deb-http:{}", repo_name)),
             store_hash: None,
             origin: InstallOrigin::Spm,
         },
@@ -561,96 +417,70 @@ fn parse_deb822_entry(text: &str, name: &str) -> Option<HashMap<String, String>>
     None
 }
 
-pub(crate) fn fetch_dnf_to_temp(
+pub(crate) fn fetch_rpm_to_temp(
     name: &str,
-    _repo_name: &str,
-    _config: &RepoConfig,
+    repo_name: &str,
+    config: &RepoConfig,
     tmp_dir: &str,
 ) -> SpmResult<FetchedPackage> {
-    let dl_dir = paths::archives_dir().join("dnf-dl");
-    fs::create_dir_all(&dl_dir)?;
+    if let Some(url) = &config.url {
+        let mirror = url.trim_end_matches('/');
+        match rpm::fetch_rpm_package(name, None, mirror) {
+            Ok(rpm_bytes) => {
+                let archive_name = format!("{}.rpm", name);
+                let rpm_path = std::path::Path::new(tmp_dir).join(&archive_name);
+                std::fs::write(&rpm_path, &rpm_bytes)?;
 
-    let dl_output = download::run_with_progress(
-        Command::new(crate::util::backend::resolve("dnf"))
-            .args(["download", "--destdir", &dl_dir.to_string_lossy(), name]),
-        &format!("⬇️  Downloading '{name}' from dnf repositories"),
-    ).map_err(|e| SpmError::command_failed(format!("dnf download failed: {e}. Is dnf available?")))?;
+                let extracted_dir = format!("{}/root", tmp_dir);
+                super::rpm::extract_rpm(
+                    &rpm_path.to_string_lossy(),
+                    &extracted_dir,
+                )?;
 
-    if !dl_output.status.success() {
-        let stderr = String::from_utf8_lossy(&dl_output.stderr);
-        return Err(SpmError::package_not_found(format!(
-            "Package '{name}' not found in dnf repositories: {stderr}"
-        )));
+                let version =
+                    match super::rpm::parse_rpm_header(&rpm_path.to_string_lossy()) {
+                        Ok(info) => info.version,
+                        Err(_) => "unknown".into(),
+                    };
+
+                let scripts = super::scripts::extract_rpm_scripts(&rpm_path.to_string_lossy())?;
+
+                return Ok(FetchedPackage {
+                    extracted_dir,
+                    files: Vec::new(),
+                    manifest: Manifest {
+                        name: name.to_string(),
+                        version: version.clone(),
+                        ..Manifest::default()
+                    },
+                    pkg: InstalledPackage {
+                        name: name.to_string(),
+                        version,
+                        format: PackageFormat::Rpm,
+                        install_type: InstallType::Native,
+                        manifest: None,
+                        install_date: Utc::now().to_rfc3339(),
+                        source_repo: Some(format!("rpm-http:{}", repo_name)),
+                        store_hash: None,
+                        origin: InstallOrigin::Spm,
+                    },
+                    conflicting_packages: Vec::new(),
+                    scripts,
+                    _tmp_dir: None,
+                });
+            }
+            Err(e) => {
+                return Err(SpmError::package_not_found(format!(
+                    "Package '{name}' not found in dnf repository '{}': {}",
+                    repo_name, e
+                )));
+            }
+        }
     }
 
-    let rpm_path = find_rpm_in_dir(&dl_dir, name)
-        .ok_or_else(|| SpmError::other(format!(
-            "dnf downloaded '{name}' but no .rpm file found in output"
-        )))?;
-
-    let version = match super::rpm::parse_rpm_header(&rpm_path) {
-        Ok(info) => info.version,
-        Err(_) => "unknown".into(),
-    };
-
-    let extracted_dir = format!("{}/root", tmp_dir);
-    fs::create_dir_all(&extracted_dir)?;
-
-    let extract_output = Command::new("rpm2cpio")
-        .arg(&rpm_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run rpm2cpio: {e}")))?;
-    if !extract_output.status.success() {
-        let stderr = String::from_utf8_lossy(&extract_output.stderr);
-        return Err(SpmError::command_failed(format!("rpm2cpio failed: {stderr}")));
-    }
-
-    let cpio = Command::new("cpio")
-        .args(["-idmv", "-D", &extracted_dir])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| SpmError::command_failed(format!("Failed to spawn cpio: {e}")))?;
-    let mut cpio_stdin = cpio.stdin
-        .as_ref()
-        .ok_or_else(|| SpmError::other("cpio stdin not available".to_string()))?;
-    cpio_stdin
-        .write_all(&extract_output.stdout)
-        .map_err(|e| SpmError::other(format!("Failed to pipe to cpio: {e}")))?;
-    let cpio_status = cpio.wait_with_output()
-        .map_err(|e| SpmError::command_failed(format!("cpio failed: {e}")))?;
-    if !cpio_status.status.success() {
-        return Err(SpmError::command_failed("cpio extraction failed".to_string()));
-    }
-
-    let scripts = super::scripts::extract_rpm_scripts(&rpm_path)?;
-
-    Ok(FetchedPackage {
-        extracted_dir,
-        files: Vec::new(),
-        manifest: Manifest {
-            name: name.to_string(),
-            version: version.clone(),
-            ..Manifest::default()
-        },
-        pkg: InstalledPackage {
-            name: name.to_string(),
-            version,
-            format: PackageFormat::Rpm,
-            install_type: InstallType::Native,
-            manifest: None,
-            install_date: Utc::now().to_rfc3339(),
-            source_repo: Some("dnf".to_string()),
-            store_hash: None,
-            origin: InstallOrigin::Spm,
-        },
-        conflicting_packages: Vec::new(),
-        scripts,
-        _tmp_dir: None,
-    })
+    Err(SpmError::config(format!(
+        "Rpm repo '{}' has no URL configured", repo_name
+    )))
 }
 
 fn find_rpm_in_dir(dir: &Path, name: &str) -> Option<String> {
@@ -803,32 +633,8 @@ fn fetch_local_rpm_to_temp(rpm_path: &Path, tmp_dir: &str) -> SpmResult<FetchedP
     let extracted_dir = format!("{}/root", tmp_dir);
     fs::create_dir_all(&extracted_dir)?;
 
-    let extract_output = Command::new(crate::util::backend::resolve("rpm2cpio"))
-        .arg(rpm_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("rpm2cpio failed: {e}")))?;
-    if !extract_output.status.success() {
-        return Err(SpmError::command_failed("rpm2cpio extraction failed"));
-    }
-
-    let mut cpio = Command::new(crate::util::backend::resolve("cpio"))
-        .args(["-idmv", "-D", &extracted_dir])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| SpmError::command_failed(format!("Failed to spawn cpio: {e}")))?;
-    if let Some(mut stdin) = cpio.stdin.take() {
-        stdin.write_all(&extract_output.stdout)
-            .map_err(|e| SpmError::other(format!("Failed to pipe to cpio: {e}")))?;
-    }
-    let cpio_status = cpio.wait_with_output()
-        .map_err(|e| SpmError::command_failed(format!("cpio failed: {e}")))?;
-    if !cpio_status.status.success() {
-        return Err(SpmError::command_failed("cpio extraction failed"));
-    }
+    // Pure Rust RPM extraction
+    super::rpm::extract_rpm(&path_str, &extracted_dir)?;
 
     let scripts = super::scripts::extract_rpm_scripts(&path_str)?;
 

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::integration;
 use crate::types::Manifest;
 
 /// Run system integration hooks after package installation.
@@ -73,24 +74,16 @@ fn run_ldconfig() {
 }
 
 fn run_systemctl_daemon_reload() {
-    match Command::new("systemctl").arg("daemon-reload").status() {
-        Ok(s) if s.success() => tracing::debug!("systemctl daemon-reload completed"),
-        _ => tracing::warn!("systemctl daemon-reload failed or not available"),
-    }
+    integration::system::daemon_reload();
+    tracing::debug!("systemctl daemon-reload (via SIGHUP) completed");
 }
 
 fn run_update_desktop_database() {
-    match Command::new("update-desktop-database").arg("-q").status() {
-        Ok(s) if s.success() => tracing::debug!("update-desktop-database completed"),
-        _ => tracing::warn!("update-desktop-database failed or not available"),
-    }
+    let _ = integration::desktop::update_desktop_database(Path::new("/usr/share/applications"));
 }
 
 fn run_mandb() {
-    match Command::new("mandb").arg("-q").status() {
-        Ok(s) if s.success() => tracing::debug!("mandb completed"),
-        _ => tracing::warn!("mandb failed or not available"),
-    }
+    let _ = integration::man::update_man_db(Path::new("/usr/share/man"));
 }
 
 /// Run SAM v2 post-install hooks: systemd_units, sysusers, tmpfiles.
@@ -229,11 +222,68 @@ fn process_tmpfiles(manifest: &Manifest) {
 }
 
 fn run_systemd_sysusers() {
-    let _ = Command::new("systemd-sysusers").status();
+    let sysusers_dir = Path::new("/etc/sysusers.d");
+    if !sysusers_dir.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(sysusers_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let content = match fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let _type = parts[0];
+            let name = parts[1];
+            let id = parts.get(2).map(|s| s.parse::<u32>().ok()).flatten();
+            let _ = integration::system::create_sysuser(name, id, id, &[]);
+        }
+    }
 }
 
 fn run_systemd_tmpfiles() {
-    let _ = Command::new("systemd-tmpfiles").args(["--create"]).status();
+    let tmpfiles_dir = Path::new("/etc/tmpfiles.d");
+    if !tmpfiles_dir.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(tmpfiles_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let content = match fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            let path_str = parts[1];
+            let mode_str = parts[2];
+            let _uid_str = parts[3];
+            let gid_str = parts[4];
+            let mode = u32::from_str_radix(mode_str, 8).unwrap_or(0o644);
+            let owner = format!("{}:{}", _uid_str, gid_str);
+            let _ = integration::system::create_tmpfile(Path::new(path_str), mode, &owner);
+        }
+    }
 }
 
 #[cfg(test)]

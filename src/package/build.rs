@@ -244,7 +244,7 @@ pub fn build_package(path: &Path, output: Option<&str>, sign_key: Option<&str>) 
     let root = find_config_dir(path)?;
     let config = load_config(&root)?;
 
-    let install_dir = "/";
+    let install_dir = "";
 
     let data_tar = if let Some(dir) = &config.install.dir {
         create_tar_from_dir(&root, dir, install_dir)?
@@ -314,6 +314,7 @@ pub fn run_build(path: &Path, output: Option<&str>, sign_key: Option<&str>) -> S
 
     if let Some(ref cmd) = config.build.command {
         crate::output::step_info("Running build command...");
+        // acceptable — build systems inherently need a shell
         let status = Command::new("sh")
             .args(["-c", cmd])
             .current_dir(&root)

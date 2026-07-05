@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use crate::db;
 use crate::error::{SpmError, SpmResult};
+use crate::integration;
 use crate::types::*;
 
 pub fn full_analysis() -> SpmResult<()> {
@@ -85,18 +85,22 @@ fn find_conflicts_internal() -> SpmResult<()> {
             let path = entry.path();
             if path.is_file() || path.is_symlink() {
                 let path_str = path.to_string_lossy().to_string();
-                let output = Command::new("dpkg")
-                    .args(["-S", &path_str])
-                    .output()
-                    .ok();
-                if let Some(out) = output {
-                    if out.status.success() {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        for line in stdout.lines() {
-                            if let Some(pkg_name) = line.split(':').next() {
-                                file_owners.entry(path_str.clone())
-                                    .or_default()
-                                    .push(pkg_name.trim().to_string());
+                // Check dpkg info list files for ownership
+                let info_dir = Path::new("/var/lib/dpkg/info");
+                if info_dir.is_dir() {
+                    if let Ok(info_entries) = fs::read_dir(info_dir) {
+                        for ie in info_entries.flatten() {
+                            let ip = ie.path();
+                            if ip.extension().and_then(|e| e.to_str()) == Some("list") {
+                                if let Ok(content) = fs::read_to_string(&ip) {
+                                    if content.lines().any(|l| l.trim() == path_str) {
+                                        if let Some(stem) = ip.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                                            file_owners.entry(path_str.clone())
+                                                .or_default()
+                                                .push(stem);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -153,18 +157,22 @@ fn find_soname_conflicts() -> HashMap<String, Vec<String>> {
                             .map(|(base, _)| format!("{}.so", base))
                             .unwrap_or_else(|| name.to_string());
 
-                        let output = Command::new("dpkg")
-                            .args(["-S", &p.to_string_lossy()])
-                            .output()
-                            .ok();
-                        if let Some(out) = output {
-                            if out.status.success() {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                for line in stdout.lines() {
-                                    if let Some(pkg_name) = line.split(':').next() {
-                                        conflicts.entry(soname.clone())
-                                            .or_default()
-                                            .push(pkg_name.trim().to_string());
+                        // Check dpkg info list files
+                        let info_dir = Path::new("/var/lib/dpkg/info");
+                        if info_dir.is_dir() {
+                            if let Ok(info_entries) = fs::read_dir(info_dir) {
+                                for ie in info_entries.flatten() {
+                                    let ip = ie.path();
+                                    if ip.extension().and_then(|e| e.to_str()) == Some("list") {
+                                        if let Ok(content) = fs::read_to_string(&ip) {
+                                            if content.lines().any(|l| l.trim() == p.to_string_lossy()) {
+                                                if let Some(stem) = ip.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                                                    conflicts.entry(soname.clone())
+                                                        .or_default()
+                                                        .push(stem);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -251,59 +259,40 @@ pub fn trace_binary(path: &str) -> SpmResult<()> {
 
     println!("Tracing: {}\n", path);
 
-    let ldd_output = Command::new("ldd")
-        .arg(path)
-        .output()
-        .map_err(|e| SpmError::command_failed(format!("Failed to run ldd: {e}. Is ldd available?")))?;
+    let deps = integration::elf::get_dynamic_dependencies(binary_path)?;
 
-    if !ldd_output.status.success() {
-        return Err(SpmError::other(format!("ldd failed for: {path}")));
+    if deps.is_empty() {
+        println!("  No dynamic dependencies (statically linked)");
+        return Ok(());
     }
 
-    let stdout = String::from_utf8_lossy(&ldd_output.stdout);
-    let mut missing_libs = Vec::new();
-    let mut found_libs = Vec::new();
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("linux-vdso") || line.starts_with("statically") {
-            continue;
-        }
-
-        if line.contains("not found") {
-            if let Some(lib) = line.split_whitespace().next() {
-                missing_libs.push(lib.to_string());
-                println!("  [MISSING] {}", lib);
+    println!("  Needed libraries:");
+    for lib in &deps {
+        let resolved = resolve_library_path(lib);
+        match resolved {
+            Some(full_path) => println!("    {} -> {}", lib, full_path),
+            None => {
+                let suggestion = suggest_package_for_lib(lib);
+                println!("    {} -> NOT FOUND (Try: apt install {} or dnf install {})", lib, suggestion, suggestion);
             }
-        } else if let Some((lib, _rest)) = line.split_once(" => ") {
-            if !lib.contains('/') {
-                let lib_name = lib.trim();
-                let resolved = _rest.split_whitespace().next().unwrap_or("");
-                if resolved != "not found" {
-                    found_libs.push((lib_name.to_string(), resolved.to_string()));
-                }
-            }
-        }
-    }
-
-    if missing_libs.is_empty() {
-        println!("\n  All dependencies resolved ✓");
-    } else {
-        println!("\n  Missing libraries:");
-        for lib in &missing_libs {
-            let suggestion = suggest_package_for_lib(lib);
-            println!("    {} -> Try: apt install {} or dnf install {}", lib, suggestion, suggestion);
-        }
-    }
-
-    if !found_libs.is_empty() {
-        println!("\n  Resolved libraries:");
-        for (lib, resolved) in &found_libs {
-            println!("    {} -> {}", lib, resolved);
         }
     }
 
     Ok(())
+}
+
+fn resolve_library_path(lib: &str) -> Option<String> {
+    let lib_paths = [
+        "/usr/lib", "/usr/lib64", "/lib", "/lib64",
+        "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
+    ];
+    for dir in &lib_paths {
+        let candidate = Path::new(dir).join(lib);
+        if candidate.exists() {
+            return candidate.to_str().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 fn suggest_package_for_lib(lib: &str) -> String {

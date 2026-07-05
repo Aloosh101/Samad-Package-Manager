@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::{SpmError, SpmResult};
+use crate::integration;
 
 fn system_apps_dir() -> PathBuf {
     if unsafe { libc::geteuid() } == 0 {
@@ -173,7 +173,7 @@ pub fn create_sandbox_desktop_entries(sandbox_name: &str, sandbox_dir: &Path) ->
     }
 
     if created_count > 0 {
-        let _ = Command::new("update-desktop-database").arg("-q").status();
+        let _ = integration::desktop::update_desktop_database(&apps_target);
         crate::output::step_info(format!(
             "Created {} desktop entr{} for sandbox '{}'",
             created_count,
@@ -219,7 +219,7 @@ pub fn remove_sandbox_desktop_entries(sandbox_name: &str) -> SpmResult<()> {
     }
 
     if removed_count > 0 {
-        let _ = Command::new("update-desktop-database").arg("-q").status();
+        let _ = integration::desktop::update_desktop_database(&apps_dir);
         tracing::debug!(
             "Removed {} desktop entr{} for sandbox '{}'",
             removed_count,

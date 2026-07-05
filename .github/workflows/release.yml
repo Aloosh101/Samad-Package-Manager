@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            arch: aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            arch: armv7-linux-gnueabihf
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: i686-linux-gnu
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: riscv64-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            armv7-*)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gcc-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross
+              ;;
+            i686-*)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gcc-i686-linux-gnu libc6-i686-cross libc6-dev-i686-cross
+              ;;
+            riscv64*)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gcc-riscv64-linux-gnu libc6-riscv64-cross libc6-dev-riscv64-cross
+              ;;
+          esac
+
+      - name: Build release
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-* | aarch64-*)
+              cargo build --release --target "${{ matrix.target }}"
+              ;;
+            armv7-*)
+              CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+                cargo build --release --target "${{ matrix.target }}"
+              ;;
+            i686-*)
+              CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc \
+                cargo build --release --target "${{ matrix.target }}"
+              ;;
+            riscv64*)
+              CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+                cargo build --release --target "${{ matrix.target }}"
+              ;;
+          esac
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/spm" "dist/spm-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/spmd" "dist/spmd-${{ matrix.arch }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spm-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-tmp
+
+      - name: Organise binaries
+        shell: bash
+        run: |
+          mkdir -p release
+          for dir in dist-tmp/spm-*; do
+            arch="$(basename "$dir" | sed 's/^spm-//')"
+            cp "$dir/spm-${arch}" "release/"
+            cp "$dir/spmd-${arch}" "release/" 2>/dev/null || true
+          done
+          cp install.sh release/
+
+      - name: Generate checksums
+        shell: bash
+        working-directory: release
+        run: sha256sum spm-* spmd-* install.sh > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          prerelease: false

@@ -7,50 +7,45 @@ use crate::types::{Dependency, DependencySource, Package, PackageFormat};
 const RPM_MAGIC: &[u8; 4] = b"\xed\xab\xee\xdb";
 
 pub fn extract_rpm(path: &str, target: &str) -> SpmResult<()> {
+    let data = fs::read(path)
+        .map_err(|e| SpmError::invalid_format(format!("Failed to open .rpm file {path}: {e}")))?;
+
     let target_path = std::path::Path::new(target);
     fs::create_dir_all(target_path)?;
 
-    let mut file = fs::File::open(path)
-        .map_err(|e| SpmError::invalid_format(format!("Failed to open .rpm file {path}: {e}")))?;
-    let mut lead = [0u8; 96];
-    file.read_exact(&mut lead)
-        .map_err(|e| SpmError::invalid_format(format!("Failed to read RPM lead: {e}")))?;
-    if &lead[0..4] != RPM_MAGIC {
+    let payload = extract_payload_from_bytes(&data)?;
+    decompress_cpio(&payload, target_path)
+}
+
+fn extract_payload_from_bytes(data: &[u8]) -> SpmResult<Vec<u8>> {
+    if data.len() < 4 || &data[..4] != RPM_MAGIC {
         return Err(SpmError::invalid_format("Invalid .rpm file: bad magic"));
     }
+    let mut offset = 96usize;
+    let (_sig_offset, sig_size) = read_index_header_at(data, offset)?;
+    offset = offset + 16 + sig_size;
+    let (_hdr_offset, hdr_size) = read_index_header_at(data, offset)?;
+    offset = offset + 16 + hdr_size;
+    Ok(data[offset..].to_vec())
+}
 
-    let _sig_data = read_index_data(&mut file, 16)?;
-    let _hdr_data = read_index_data(&mut file, 16)?;
-
-    let mut payload = Vec::new();
-    file.read_to_end(&mut payload)?;
-
-    let result = decompress_cpio(&payload, target_path);
-
-    if result.is_ok() {
-        return result;
+fn read_index_header_at(data: &[u8], offset: usize) -> SpmResult<(usize, usize)> {
+    if offset + 16 > data.len() {
+        return Err(SpmError::invalid_format("RPM data truncated at index header"));
     }
-
-    tracing::debug!("Built-in CPIO parser failed, falling back to rpm2cpio: {}", result.unwrap_err());
-    let status = std::process::Command::new("rpm2cpio")
-        .arg(path)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| SpmError::command_failed(format!("Failed to spawn rpm2cpio: {e}")))
-        .and_then(|child| {
-            let output = std::process::Command::new("cpio")
-                .args(["-idmv", "-D", target])
-                .stdin(child.stdout.unwrap())
-                .output()
-                .map_err(|e| SpmError::command_failed(format!("Failed to run cpio: {e}")))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(SpmError::command_failed(format!("cpio failed: {stderr}")));
-            }
-            Ok(())
-        });
-
-    status
+    let nindex = u32::from_be_bytes([
+        data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+    ]) as usize;
+    let hsize = u32::from_be_bytes([
+        data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15],
+    ]) as usize;
+    if nindex > 65536 || hsize > 4 * 1024 * 1024 {
+        return Err(SpmError::invalid_format(format!(
+            "RPM header too large: {nindex} entries, {hsize} byte store"
+        )));
+    }
+    let store_size = (nindex * 16 + hsize + 7) & !7;
+    Ok((offset + 16, store_size))
 }
 
 fn decompress_cpio(data: &[u8], target: &std::path::Path) -> SpmResult<()> {

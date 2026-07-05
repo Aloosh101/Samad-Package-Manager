@@ -18,12 +18,12 @@ pub fn update_index(
     config: &crate::types::RepoConfig,
 ) -> SpmResult<()> {
     let cache_dir = crate::config::paths::repos_cache_dir()
-        .join("apt")
+        .join("deb")
         .join(repo_name);
 
     if !cache_dir.exists() {
         return Err(SpmError::other(format!(
-            "Apt repo cache '{}' not found. Run spm update first.",
+            "Deb repo cache '{}' not found. Run spm update first.",
             repo_name
         )));
     }
@@ -72,7 +72,7 @@ pub fn update_index(
             index.insert_provider(
                 soname,
                 SonameProvider {
-                    source: RepoSource::Apt,
+                    source: RepoSource::Deb,
                     repo: repo_name.to_string(),
                     pkg: pkg_name.to_string(),
                     version: info.version.clone(),
@@ -90,7 +90,7 @@ pub fn update_index(
         index.insert_provider(
             pkg_name,
             SonameProvider {
-                source: RepoSource::Apt,
+                source: RepoSource::Deb,
                 repo: repo_name.to_string(),
                 pkg: pkg_name.clone(),
                 version: info.version.clone(),

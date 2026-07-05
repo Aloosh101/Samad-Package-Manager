@@ -43,7 +43,7 @@ pub enum SpmCommand {
         /// Prefer the newest version over repo priority (bleeding edge)
         #[arg(long)]
         prefer_newest: bool,
-        /// Stable from Debian repos (stable + apt, highest priority)
+        /// Stable from Debian repos (deb format, highest priority)
         #[arg(long)]
         stable_debian: bool,
         /// Newest from RedHat repos (newest + rpm, highest priority)
@@ -98,7 +98,7 @@ pub enum SpmCommand {
         /// Prefer the newest version over repo priority (bleeding edge)
         #[arg(long)]
         prefer_newest: bool,
-        /// Stable from Debian repos (stable + apt, highest priority)
+        /// Stable from Debian repos (deb format, highest priority)
         #[arg(long)]
         stable_debian: bool,
         /// Newest from RedHat repos (newest + rpm, highest priority)
@@ -212,7 +212,7 @@ pub enum SpmCommand {
 
     /// Add, list, or remove package repositories (repository)
     #[command(alias = "repository",
-        after_help = "Examples:\n  spm repo add debian --source apt --mirror http://deb.debian.org/debian\n  spm repo list\n  spm repo remove myrepo\n  spm repo gen-key myrepo         Generate Ed25519 signing key\n  spm repo sign myrepo            Sign Release file with key"
+        after_help = "Examples:\n  spm repo add debian --source deb --mirror http://deb.debian.org/debian\n  spm repo list\n  spm repo remove myrepo\n  spm repo gen-key myrepo         Generate Ed25519 signing key\n  spm repo sign myrepo            Sign Release file with key"
     )]
     Repo {
         #[command(subcommand)]
@@ -356,13 +356,13 @@ pub enum RepoAction {
     Add {
         /// Repository name (used as identifier)
         name: String,
-        /// Repository format: apt, dnf, or native
+        /// Repository format: deb, rpm, or native
         #[arg(long, short, default_value = "native")]
         source: String,
-        /// Repository base URL (for apt/dnf repos)
+        /// Repository base URL (for deb/rpm repos)
         #[arg(long, short)]
         url: Option<String>,
-        /// Mirror URLs for apt repositories
+        /// Mirror URLs for deb repositories
         #[arg(long)]
         mirror: Vec<String>,
         /// Priority (lower number = higher priority, default: 100)
@@ -370,24 +370,24 @@ pub enum RepoAction {
         priority: u32,
     },
     /// Create a new repository (initialise directory structure)
-    #[command(after_help = "Examples:\n  spm repo create myrepo --source native --path /srv/spm/repos\n  spm repo create myrepo --source apt --path /srv/spm/repos --codename stable --component main\n  spm repo create myrepo --source dnf --path /srv/spm/repos\n  spm repo create myrepo --source native                  (default path: /var/lib/spm/repos/native/<name>)"
+    #[command(after_help = "Examples:\n  spm repo create myrepo --source native --path /srv/spm/repos\n  spm repo create myrepo --source deb --path /srv/spm/repos --codename stable --component main\n  spm repo create myrepo --source rpm --path /srv/spm/repos\n  spm repo create myrepo --source native                  (default path: /var/lib/spm/repos/native/<name>)"
     )]
     Create {
         /// Repository name
         name: String,
-        /// Repository format: apt, dnf, native
+        /// Repository format: deb, rpm, native
         #[arg(long, short, default_value = "native")]
         source: String,
         /// Base path for the repository (default: /var/lib/spm/repos/<source>/<name>)
         #[arg(long, short)]
         path: Option<String>,
-        /// Distribution codename (for apt repos only, default: stable)
+        /// Distribution codename (for deb repos only, default: stable)
         #[arg(long)]
         codename: Option<String>,
-        /// Repository component (for apt repos only, default: main)
+        /// Repository component (for deb repos only, default: main)
         #[arg(long)]
         component: Option<String>,
-        /// First mirror URL (for apt repos)
+        /// First mirror URL (for deb repos)
         #[arg(long)]
         mirror: Option<String>,
     },
@@ -461,10 +461,10 @@ impl SpmArgs {
     ) -> (crate::types::VersionStrategy, Option<crate::types::RepoSource>) {
         // Atomic modes take highest priority
         if cli_stable_debian {
-            return (crate::types::VersionStrategy::PreferStable, Some(crate::types::RepoSource::Apt));
+            return (crate::types::VersionStrategy::PreferStable, Some(crate::types::RepoSource::Deb));
         }
         if cli_newest_redhat {
-            return (crate::types::VersionStrategy::PreferNewest, Some(crate::types::RepoSource::Dnf));
+            return (crate::types::VersionStrategy::PreferNewest, Some(crate::types::RepoSource::Rpm));
         }
         // --prefer-newest or config fallback
         let strategy = if cli_prefer_newest {
@@ -492,7 +492,7 @@ impl SpmArgs {
                 convert_only,
                 replace,
                 yes,
-                smart: _,
+                smart,
                 prefer_newest,
                 stable_debian,
                 newest_redhat,
@@ -505,7 +505,7 @@ impl SpmArgs {
                         *prefer_newest, *stable_debian, *newest_redhat,
                     );
                     let sandbox_level = sandbox.as_ref().and_then(|s| s.as_deref()).unwrap_or("standard");
-                    install::install_package(package, Some(sandbox_level), *replace, *yes, strategy)?;
+                    install::install_package(package, Some(sandbox_level), *replace, *yes, *smart, strategy)?;
                 } else if Self::is_local_path(package) {
                     install::install_local_package(package, *replace, *yes)?;
                 } else {
@@ -532,11 +532,11 @@ impl SpmArgs {
                 }
                 RepoAction::Create { name, source, path, codename, component, mirror } => {
                     let source_enum = match source.as_str() {
-                        "apt" => crate::types::RepoSource::Apt,
-                        "dnf" => crate::types::RepoSource::Dnf,
+                        "deb" => crate::types::RepoSource::Deb,
+                        "rpm" => crate::types::RepoSource::Rpm,
                         "native" => crate::types::RepoSource::Native,
                         _ => return Err(crate::error::SpmError::config(
-                            format!("Invalid repo source '{source}'. Use apt, dnf, or native")
+                            format!("Invalid repo source '{source}'. Use deb, rpm, or native")
                         )),
                     };
                     repos::create_repo(name, source_enum, path.as_deref(), codename.as_deref(), component.as_deref(), mirror.as_deref())?;
@@ -784,13 +784,11 @@ impl SpmArgs {
 
 fn fetch_json(url: &str, timeout_secs: u64) -> Option<serde_json::Value> {
     use std::time::Duration;
-    let resp = ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
-        .call()
         .ok()?;
-    let body = resp.into_body().read_to_vec().ok()?;
+    let body = client.get(url).send().ok()?.bytes().ok()?;
     serde_json::from_slice(&body).ok()
 }
 
@@ -965,14 +963,14 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
             // Check if any configured repo has this package
             let repos_list = repos::load_repos()?;
             let has_pkg = repos_list.iter().any(|(rn, rc)| {
-                matches!(rc.source, crate::types::RepoSource::Apt)
+                matches!(rc.source, crate::types::RepoSource::Deb)
                     && install::repo_has_package(pkg_name, rn, rc)
             });
 
             if !has_pkg {
                 // Check if Debian repo is configured
                 let has_debian = repos_list.iter().any(|(n, rc)| {
-                    n == "debian" && matches!(rc.source, crate::types::RepoSource::Apt)
+                    n == "debian" && matches!(rc.source, crate::types::RepoSource::Deb)
                 });
 
                 if has_debian {
@@ -983,7 +981,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
                     // Check again after update
                     let repos_list2 = repos::load_repos()?;
                     let has_pkg2 = repos_list2.iter().any(|(rn, rc)| {
-                        matches!(rc.source, crate::types::RepoSource::Apt)
+                        matches!(rc.source, crate::types::RepoSource::Deb)
                             && install::repo_has_package(pkg_name, rn, rc)
                     });
 
@@ -1006,7 +1004,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
 
                     repos::add_repo(
                         "debian",
-                        crate::types::RepoSource::Apt,
+                        crate::types::RepoSource::Deb,
                         None,
                         Some(vec!["http://deb.debian.org/debian".into()]),
                         None,
@@ -1017,7 +1015,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
             }
 
             // Install from Debian apt repo with smart mode (library isolation) for cross-distro safety
-            match install::install_package_from_repo(pkg_name, crate::types::RepoSource::Apt, false, true, true, Default::default(), None) {
+            match install::install_package_from_repo(pkg_name, crate::types::RepoSource::Deb, false, true, true, Default::default(), None) {
                 Ok(()) => {
                     if cache {
                         let cache_dir = crate::config::paths::archives_dir();
@@ -1044,7 +1042,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
                 full_name, chroot
             );
 
-            // Try HTTP direct download first (no dnf needed)
+            // Pure Rust HTTP download (no external dnf needed)
             match crate::package::fetch::gs::download_rpm_from_repo(&repo_base, &chosen.name) {
                 Ok(rpm_bytes) => {
                     let rpm_path = format!("/tmp/{}.rpm", chosen.name);
@@ -1052,7 +1050,6 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
                         crate::output::step_warn(format!("Failed to write RPM: {e}"));
                     } else {
                         crate::output::section(format!("📦 Downloaded {} from COPR", chosen.name));
-                        // Install via spm local file install
                         match crate::package::install::install_local_package(&rpm_path, false, true) {
                             Ok(()) => {
                                 if cache {
@@ -1063,81 +1060,15 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
                             }
                             Err(e) => {
                                 crate::output::step_warn(format!("Failed to install downloaded RPM: {e}"));
-                                crate::output::step_info("Falling back to dnf...");
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    crate::output::step_info(format!("HTTP download not available: {e}"));
-                    crate::output::step_info("Falling back to dnf...");
+                    return Err(crate::error::SpmError::network(
+                        format!("Pure Rust HTTP download failed for COPR package '{}': {e}", chosen.name)
+                    ));
                 }
-            }
-
-            // Fallback: use dnf
-            let repo_name = format!("copr-{}", full_name.replace(['/', '.'], "-"));
-            let repo_url = format!(
-                "https://copr.fedorainfracloud.org/repos/{}/repo/fedora-$releasever-{}/",
-                full_name, arch
-            );
-            let repo_config = format!(
-                "[{}]\nname=COPR {}\nbaseurl={}\nenabled=1\ntype=rpm-md\n",
-                repo_name, full_name, repo_url
-            );
-            let repo_dir = crate::config::paths::repos_config_dir().join("copr");
-            let _ = std::fs::create_dir_all(&repo_dir);
-            let repo_path = repo_dir.join(format!("{}.repo", repo_name));
-            if std::fs::write(&repo_path, repo_config).is_ok() {
-                crate::output::step_info(format!("Added COPR repository: {}", repo_path.display()));
-            } else {
-                crate::output::step_warn("Could not add COPR repository automatically");
-                return Ok(());
-            }
-
-            crate::output::step_info("Querying available packages from this COPR repository...");
-            let list_output = std::process::Command::new("dnf")
-                .args(["repoquery", "--disablerepo=*", "--enablerepo", &repo_name, "--available", "--quiet"])
-                .output().ok();
-
-            let mut pkgs: Vec<String> = match list_output {
-                Some(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
-                }
-                _ => Vec::new(),
-            };
-
-            if pkgs.is_empty() {
-                crate::output::step_warn("No packages found in this COPR repository.");
-                return Ok(());
-            }
-
-            let pkg_name = if pkgs.len() == 1 {
-                pkgs.remove(0)
-            } else if !yes && std::io::stdin().is_terminal() {
-                println!();
-                let width = (pkgs.len().checked_ilog10().unwrap_or(0) + 1) as usize;
-                for (i, p) in pkgs.iter().enumerate() { println!("  {i:>width$}. {}", crate::output::bold(p)); }
-                let sel = loop {
-                    let input = {
-                        eprint!("  {} Select package: ", crate::output::cyan("?"));
-                        let _ = std::io::stdout().flush();
-                        let mut buf = String::new();
-                        if std::io::stdin().read_line(&mut buf).is_err() { return Ok(()); }
-                        buf.trim().to_lowercase()
-                    };
-                    if input == "q" { return Ok(()); }
-                    match input.parse::<usize>() { Ok(n) if n < pkgs.len() => break n, _ => crate::output::step_warn("Invalid") }
-                };
-                pkgs[sel].clone()
-            } else { pkgs[0].clone() };
-
-            crate::output::section(format!("📦 Installing {} via dnf", pkg_name));
-            let status = std::process::Command::new("dnf").args(["install", "-y", &pkg_name]).status();
-            if status.map(|s| s.success()).unwrap_or(false) {
-                crate::output::result_message(format!("Installed {}", pkg_name));
-            } else {
-                crate::output::step_warn(format!("dnf could not install '{}'.", pkg_name));
             }
         }
     }
