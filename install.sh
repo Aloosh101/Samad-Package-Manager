@@ -157,19 +157,12 @@ else
 fi
 
 download() {
-  local name="$1"
+  local name="$1" label="$2"
   local dest="/tmp/${name}"
   local url="${BASE}/${name}"
 
-  detail "source: ${url}"
-
-  local size_hint
-  size_hint=$(curl -sI "$url" 2>/dev/null \
-    | grep -i '^content-length:' \
-    | awk '{printf "%.1f MB", $2/1048576}')
-  if [ -n "$size_hint" ]; then
-    detail "size: ${CYAN}${size_hint}${NC}"
-  fi
+  info "Downloading ${BOLD}${label}${NC} ..."
+  detail "${url}"
 
   if command -v curl &>/dev/null; then
     curl -fL --progress-bar "$url" -o "$dest"
@@ -178,7 +171,7 @@ download() {
   fi
 
   if [ ! -s "$dest" ]; then
-    err "download failed: ${name}"
+    err "download failed: ${label} (${name})"
     exit 1
   fi
 
@@ -187,9 +180,9 @@ download() {
   if [ "$file_size" -gt 0 ]; then
     local size_display
     size_display=$(echo "$file_size" | awk '{printf "%.1f MB", $1/1048576}')
-    ok "${name}  ${DIM}(${size_display})${NC}"
+    ok "${label}  ${DIM}(${size_display})${NC}"
   else
-    ok "${name}"
+    ok "${label}"
   fi
 
   chmod +x "$dest"
@@ -225,10 +218,10 @@ verify_checksum() {
   rm -f /tmp/checksums.txt
 }
 
-DL_SPM=$(download "spm-${ARCH}")
+DL_SPM=$(download "spm-${ARCH}" "spm (CLI)")
 verify_checksum "$DL_SPM" "spm-${ARCH}"
 
-DL_SPMD=$(download "spmd-${ARCH}")
+DL_SPMD=$(download "spmd-${ARCH}" "spmd (daemon)")
 verify_checksum "$DL_SPMD" "spmd-${ARCH}"
 
 # ═══════════════════════════════════════════════════════════════════
