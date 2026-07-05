@@ -95,6 +95,7 @@ jobs:
   release:
     name: Create Release
     needs: build
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -109,9 +110,10 @@ jobs:
         run: |
           mkdir -p release
           for dir in dist-tmp/spm-*; do
+            [ -d "$dir" ] || continue
             arch="$(basename "$dir" | sed 's/^spm-//')"
-            cp "$dir/spm-${arch}" "release/"
-            cp "$dir/spmd-${arch}" "release/" 2>/dev/null || true
+            [ -f "$dir/spm-${arch}" ] && cp "$dir/spm-${arch}" "release/"
+            [ -f "$dir/spmd-${arch}" ] && cp "$dir/spmd-${arch}" "release/"
           done
           cp install.sh release/
 
