@@ -29,6 +29,7 @@ This auto-detects your architecture and installs the pre-built binary. No Rust t
 |-------|------|
 | Installation & setup | [docs/installation.md](docs/installation.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) |
+| Principles & philosophy | [docs/principles.md](docs/principles.md) |
 | Usage & commands | [docs/usage.md](docs/usage.md) |
 | Contributing | [docs/contributing.md](docs/contributing.md) |
 
