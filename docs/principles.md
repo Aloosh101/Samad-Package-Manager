@@ -8,7 +8,7 @@
 
 SPM extracts `.deb`, `.rpm`, and `.sam` archives using pure Rust parsers. No `dpkg`, no `rpm2cpio`, no `apt-get`, no `dnf`. This eliminates an entire class of dependency-chain failures and makes SPM auditable from a single codebase.
 
-*"A package manager that depends on the very tools it manages has abdicated its responsibility."*
+*"A package manager that depends on the very tools it manages has surrendered its independence."*
 
 ## 2. Atomic Transactions
 
@@ -43,7 +43,7 @@ Users should not be locked into a distribution by its package format. SPM treats
 
 SPM's daemon serves packages over a Unix socket, enabling LAN distribution without a central server, internet connection, or cloud dependency. Repositories can be mirrored, cached, and shared neighbour-to-neighbour.
 
-*"The network is optional. The neighbourhood is not."*
+*"The internet is optional. The LAN is not."*
 
 ## 7. Transparency
 
