@@ -9,6 +9,11 @@
 
 > A universal Linux package manager with content-addressed storage, cross-distro support, and sandbox isolation.
 
+> *"Good artists copy; great artists steal."* — Picasso  
+> *"Don't reinvent the wheel. Make it better, faster, and more efficient."*
+
+SPM does not try to compete with apt, dnf, or Nix. It steals their best ideas and delivers a whole greater than the sum of its parts.
+
 SPM manages packages from `.deb`, `.rpm`, and its native `.sam` formats through a single CLI, backed by a BLAKE3 content-addressed store, PubGrub dependency resolution, Linux namespace sandboxing, and a Unix-socket daemon with `SO_PEERCRED` kernel-level authentication.
 
 ---
