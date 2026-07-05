@@ -283,61 +283,61 @@ else
   detail "run ${BOLD}spm init${NC} manually"
 fi
 
-# ── Auto-configure standard repos ──
+# ── Repository setup ──
 setup_repos() {
   printf "\n${BLUE}┌─ Repository setup${NC}\n" >&2
   printf "${BLUE}│${NC}\n" >&2
 
-  case "$DISTRO_FAMILY" in
-    debian)
-      printf "${BLUE}│${NC}  Adding Debian repository...\n" >&2
-      ${SUDO} spm repo add debian --source deb --mirror http://deb.debian.org/debian >/dev/null 2>&1 \
-        && ok "Debian repo added" \
-        || detail "Debian repo skipped"
-      ;;
-    fedora)
-      printf "${BLUE}│${NC}  Adding Fedora repository...\n" >&2
-      ${SUDO} spm repo add fedora --source rpm --mirror https://mirrors.kernel.org/fedora >/dev/null 2>&1 \
-        && ok "Fedora repo added" \
-        || detail "Fedora repo skipped"
-      ;;
-    suse)
-      printf "${BLUE}│${NC}  Adding openSUSE repository...\n" >&2
-      ${SUDO} spm repo add opensuse --source rpm --mirror https://mirror.opensuse.org >/dev/null 2>&1 \
-        && ok "openSUSE repo added" \
-        || detail "openSUSE repo skipped"
-      ;;
-    arch)
-      printf "${BLUE}│${NC}  Adding Arch Linux repository...\n" >&2
-      ${SUDO} spm repo add arch --source native --mirror https://mirror.archlinux.org >/dev/null 2>&1 \
-        && ok "Arch repo added" \
-        || detail "Arch repo skipped"
-      ;;
-    *)
-      printf "${BLUE}│${NC}  ${DIM}unknown distro — add repos manually with:${NC}\n" >&2
-      printf "${BLUE}│${NC}  ${CYAN}spm repo add <name> --source <deb|rpm|native> --mirror <url>${NC}\n" >&2
-      ;;
-  esac
+  # 1. Standard open-source repos (Ubuntu + Fedora always)
+  printf "${BLUE}│${NC}  Adding ${BOLD}Ubuntu${NC} (deb) repository...\n" >&2
+  ${SUDO} spm repo add ubuntu --source deb \
+    --mirror http://archive.ubuntu.com/ubuntu >/dev/null 2>&1 \
+    && ok "Ubuntu repo added (deb)" \
+    || detail "Ubuntu repo skipped"
 
-  # Ask about closed-source repos
+  printf "${BLUE}│${NC}  Adding ${BOLD}Fedora${NC} (rpm) repository...\n" >&2
+  ${SUDO} spm repo add fedora --source rpm \
+    --mirror https://mirrors.kernel.org/fedora >/dev/null 2>&1 \
+    && ok "Fedora repo added (rpm)" \
+    || detail "Fedora repo skipped"
+
   printf "${BLUE}│${NC}\n" >&2
-  printf "${BLUE}│${NC}  ${BOLD}Add closed-source repositories?${NC} ${DIM}(non-free, rpmfusion, etc.)${NC}\n" >&2
+
+  # 2. Ask about closed-source
+  printf "${BLUE}│${NC}  ${BOLD}Add closed-source repositories?${NC}\n" >&2
+  printf "${BLUE}│${NC}  ${DIM}(Ubuntu multiverse/restricted + RPM Fusion non-free)${NC}\n" >&2
   printf "${BLUE}│${NC}  ${DIM}[y/N]${NC} " >&2
   read -r yn </dev/tty || yn="n"
   case "${yn:-n}" in
     y|Y|yes|YES)
-      case "$DISTRO_FAMILY" in
-        debian)
-          ${SUDO} spm repo add debian-nonfree --source deb --mirror http://deb.debian.org/debian >/dev/null 2>&1 \
-            && ok "Debian non-free added" \
-            || detail "non-free skipped"
-          ;;
-        fedora)
-          ${SUDO} spm repo add rpmfusion-nonfree --source rpm --mirror https://mirrors.rpmfusion.org >/dev/null 2>&1 \
-            && ok "RPM Fusion non-free added" \
-            || detail "RPM Fusion skipped"
-          ;;
-      esac
+      ${SUDO} spm repo add ubuntu-nonfree --source deb \
+        --mirror http://archive.ubuntu.com/ubuntu >/dev/null 2>&1 \
+        && ok "Ubuntu non-free added" \
+        || detail "Ubuntu non-free skipped"
+      ${SUDO} spm repo add rpmfusion-nonfree --source rpm \
+        --mirror https://mirrors.rpmfusion.org >/dev/null 2>&1 \
+        && ok "RPM Fusion non-free added" \
+        || detail "RPM Fusion skipped"
+      printf "${BLUE}│${NC}\n" >&2
+      ;;
+  esac
+
+  # 3. Ask about stable vs latest
+  printf "${BLUE}│${NC}  ${BOLD}Prefer bleeding-edge (latest) or stable?${NC}\n" >&2
+  printf "${BLUE}│${NC}  ${DIM}latest  = Fedora/rpm first, fallback to Debian/deb${NC}\n" >&2
+  printf "${BLUE}│${NC}  ${DIM}stable = Debian/deb first, fallback to Fedora/rpm${NC}\n" >&2
+  printf "${BLUE}│${NC}  ${DIM}[sTABLE/latest]${NC} " >&2
+  read -r pref </dev/tty || pref="stable"
+  case "${pref:-stable}" in
+    l|L|latest|Latest|LATEST)
+      ${SUDO} spm config set preferred_source "dnf" >/dev/null 2>&1
+      ${SUDO} spm config set prefer_newest "true" >/dev/null 2>&1
+      ok "Source: ${BOLD}Fedora/rpm${NC} (latest — falls back to Debian/deb)"
+      ;;
+    *)
+      ${SUDO} spm config set preferred_source "apt" >/dev/null 2>&1
+      ${SUDO} spm config set prefer_newest "false" >/dev/null 2>&1
+      ok "Source: ${BOLD}Debian/deb${NC} (stable — falls back to Fedora/rpm)"
       ;;
   esac
 
