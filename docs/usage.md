@@ -5,13 +5,11 @@
 ```bash
 # Add a Debian repository
 spm repo add debian --source deb \
-  --mirrors https://deb.debian.org/debian \
-  --codename stable --components main
+  --mirror https://deb.debian.org/debian
 
 # Add an RPM repository
 spm repo add fedora --source rpm \
-  --mirrors https://mirror.example.com/fedora \
-  --codename 40 --components main
+  --mirror https://mirror.example.com/fedora
 
 # List repositories
 spm repo list

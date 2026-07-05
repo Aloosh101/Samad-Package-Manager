@@ -54,7 +54,7 @@ sudo cp target/release/spmd /usr/local/bin/spmd
 spm init
 
 # Add a repository
-spm repo add debian --source deb --mirrors https://deb.debian.org/debian --codename stable --components main
+spm repo add debian --source deb --mirror https://deb.debian.org/debian
 
 # Update metadata
 spm update

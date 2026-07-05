@@ -1,7 +1,7 @@
 # SPM — Samad Package Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.2-blue" alt="Version">
   <img src="https://img.shields.io/badge/rustc-2021+-orange" alt="Rust Edition">
   <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-green" alt="License">
   <img src="https://img.shields.io/badge/status-beta-green" alt="Status">
@@ -71,8 +71,7 @@ curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/do
 
 # Add Debian repo
 spm repo add debian --source deb \
-  --mirrors https://deb.debian.org/debian \
-  --codename stable --components main
+  --mirror https://deb.debian.org/debian
 
 # Update metadata
 spm update
