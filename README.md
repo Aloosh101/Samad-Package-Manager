@@ -1,10 +1,10 @@
 # SPM — Samad Package Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/rustc-2021+-orange" alt="Rust Edition">
   <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-green" alt="License">
-  <img src="https://img.shields.io/badge/status-alpha-yellow" alt="Status">
+  <img src="https://img.shields.io/badge/status-beta-green" alt="Status">
 </p>
 
 > A universal Linux package manager with content-addressed storage, cross-distro support, and sandbox isolation.
@@ -151,9 +151,9 @@ cargo clippy --no-deps
 
 ## Project Status
 
-SPM is in **active development** (v0.3.0). All modules compile cleanly and core
-package operations (install, remove, update, search, info, files, history) work
-end-to-end with Debian repositories.
+SPM is in **beta** (v0.3.1). The core feature set is complete: package operations
+install, remove, update, search, info, files, and history work end-to-end with
+Debian repositories across multiple architectures.
 
 ---
 
