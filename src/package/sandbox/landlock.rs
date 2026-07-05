@@ -4,9 +4,19 @@ mod imp {
     use std::path::Path;
     use std::path::PathBuf;
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     const LANDLOCK_CREATE_RULESET_SYSCALL: i64 = 444;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     const LANDLOCK_ADD_RULE_SYSCALL: i64 = 445;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     const LANDLOCK_RESTRICT_SELF_SYSCALL: i64 = 446;
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    const LANDLOCK_CREATE_RULESET_SYSCALL: isize = 444;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    const LANDLOCK_ADD_RULE_SYSCALL: isize = 445;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+    const LANDLOCK_RESTRICT_SELF_SYSCALL: isize = 446;
 
     const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 
@@ -88,12 +98,12 @@ mod imp {
             };
 
             let ruleset_fd = unsafe {
-                libc::syscall(
-                    LANDLOCK_CREATE_RULESET_SYSCALL,
-                    &attr as *const landlock_ruleset_attr,
-                    std::mem::size_of::<landlock_ruleset_attr>(),
-                    0u32,
-                ) as libc::c_int
+                    libc::syscall(
+                        LANDLOCK_CREATE_RULESET_SYSCALL,
+                        &attr as *const landlock_ruleset_attr,
+                        std::mem::size_of::<landlock_ruleset_attr>(),
+                        0,
+                    ) as libc::c_int
             };
 
             if ruleset_fd < 0 {
@@ -137,7 +147,7 @@ mod imp {
                         ruleset_fd as libc::c_int,
                         LANDLOCK_RULE_PATH_BENEATH,
                         &path_beneath as *const landlock_path_beneath_attr,
-                        0u32,
+                        0,
                     )
                 };
                 unsafe { libc::close(fd) };
@@ -152,7 +162,7 @@ mod imp {
                 libc::syscall(
                     LANDLOCK_RESTRICT_SELF_SYSCALL,
                     ruleset_fd as libc::c_int,
-                    0u32,
+                    0,
                 )
             };
             unsafe { libc::close(ruleset_fd) };

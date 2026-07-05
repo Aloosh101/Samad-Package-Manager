@@ -19,6 +19,12 @@ mod imp {
     const AUDIT_ARCH: u32 = 0xc000003e;
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 0xc00000b7;
+    #[cfg(target_arch = "arm")]
+    const AUDIT_ARCH: u32 = 0x40000028;
+    #[cfg(target_arch = "x86")]
+    const AUDIT_ARCH: u32 = 0x40000006;
+    #[cfg(target_arch = "riscv64")]
+    const AUDIT_ARCH: u32 = 0xc00000f3;
 
     #[repr(C)]
     struct sock_filter {
