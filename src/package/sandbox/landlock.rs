@@ -99,7 +99,7 @@ mod imp {
 
             let ruleset_fd = unsafe {
                     libc::syscall(
-                        LANDLOCK_CREATE_RULESET_SYSCALL,
+                        LANDLOCK_CREATE_RULESET_SYSCALL.into(),
                         &attr as *const landlock_ruleset_attr,
                         std::mem::size_of::<landlock_ruleset_attr>(),
                         0,
@@ -143,7 +143,7 @@ mod imp {
 
                 let ret = unsafe {
                     libc::syscall(
-                        LANDLOCK_ADD_RULE_SYSCALL,
+                        LANDLOCK_ADD_RULE_SYSCALL.into(),
                         ruleset_fd as libc::c_int,
                         LANDLOCK_RULE_PATH_BENEATH,
                         &path_beneath as *const landlock_path_beneath_attr,
@@ -160,7 +160,7 @@ mod imp {
 
             let ret = unsafe {
                 libc::syscall(
-                    LANDLOCK_RESTRICT_SELF_SYSCALL,
+                    LANDLOCK_RESTRICT_SELF_SYSCALL.into(),
                     ruleset_fd as libc::c_int,
                     0,
                 )
