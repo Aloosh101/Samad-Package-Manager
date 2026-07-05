@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-#
-# install.sh — Install SPM binary from GitHub Releases
-#
-# Usage:
+
+# ═══════════════════════════════════════════════════════════════════
+# install.sh — SPM binary installer
 #   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | sudo bash
-#   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | bash -s -- --user
-#   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | bash -s -- --version v0.3.1
 #
 # Options:
-#   --user          Install to ~/.local/bin instead of /usr/local/bin
-#   --version TAG   Install a specific version (default: latest)
-#   --help          Show this help
-#
-
-set -euo pipefail
+#   --user          Install to ~/.local/bin
+#   --version TAG   Install specific version (default: latest)
+#   --help          Show help
+# ═══════════════════════════════════════════════════════════════════
 
 BOLD='\033[1m'
 RED='\033[31m'
@@ -25,307 +20,268 @@ BLUE='\033[34m'
 MAGENTA='\033[35m'
 DIM='\033[2m'
 NC='\033[0m'
-ERASE='\033[2K'
 
-step()   { printf "\n${BOLD}${BLUE}▸ Step %s${NC}\n" "$*"; }
-info()   { printf "  ${CYAN}%s${NC}\n" "$*"; }
-ok()     { printf "  ${GREEN}✔ %s${NC}\n" "$*"; }
-warn()   { printf "  ${YELLOW}⚠ %s${NC}\n" "$*"; }
-err()    { printf "  ${RED}✘ %s${NC}\n" "$*"; }
-header() { printf "\n${BOLD}${MAGENTA}══ %s ══${NC}\n" "$*"; }
-detail() { printf "  ${DIM}%s${NC}\n" "$*"; }
+# All formatted output helpers write to stderr (>&2) so they never
+# get captured by command substitutions like DL="$(download ...)".
+info()  { printf "${DIM}  • %s${NC}\n" "$*" >&2; }
+ok()    { printf "  ${GREEN}✔${NC} %s\n" "$*" >&2; }
+warn()  { printf "  ${YELLOW}⚠${NC} %s\n" "$*" >&2; }
+err()   { printf "  ${RED}✘${NC} %s\n" "$*" >&2; }
+detail(){ printf "${DIM}    %s${NC}\n" "$*" >&2; }
 
-usage() {
-    sed -n '/^#$/q; /^#/p' "$0" | sed 's/^# //; s/^#//'
-    exit 0
+block() {
+  local title="$1"; shift
+  printf "${BOLD}${BLUE}┌─ ${title}${NC}\n" >&2
+  for line in "$@"; do
+    printf "${BOLD}${BLUE}│${NC}  ${line}\n" >&2
+  done
+  printf "${BOLD}${BLUE}└─${NC}\n" >&2
 }
 
-# ── Spinner ──
-spinner() {
-    local pid=$1
-    local msg=$2
-    local spin='|/-\'
-    local i=0
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "  ${CYAN}%c${NC} ${DIM}%s${NC}\r" "${spin:$i:1}" "$msg"
-        i=$(( (i+1) % 4 ))
-        sleep 0.15
-    done
-    printf "  ${GREEN}✔${NC} ${DIM}%s${NC}  \n" "$msg"
-    wait "$pid"
+step() {
+  printf "\n${BOLD}${MAGENTA}┃ Step ${1}/5 ┃${NC} ${BOLD}${2}${NC}\n" >&2
+  printf "${MAGENTA}┃${NC}\n" >&2
 }
+
+# ── Parse arguments ──
+USER_MODE=""
+VERSION="latest"
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h)
+      sed -n '5,11p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    --user)    USER_MODE="user" ;;
+    --version=*) VERSION="${arg#*=}" ;;
+  esac
+done
+
+trap 'rm -f /tmp/spm-* /tmp/spmd-* /tmp/checksums.txt 2>/dev/null; printf "\n" >&2' EXIT
 
 # ── Detect architecture ──
 detect_arch() {
-    local arch
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64)  echo "x86_64-linux-gnu" ;;
-        aarch64|arm64) echo "aarch64-linux-gnu" ;;
-        armv7l|armv7)  echo "armv7-linux-gnueabihf" ;;
-        i686|i386)     echo "i686-linux-gnu" ;;
-        riscv64)       echo "riscv64-linux-gnu" ;;
-        *)             err "Unsupported architecture: $arch"; exit 1 ;;
-    esac
+  local arch; arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)  echo "x86_64-linux-gnu" ;;
+    aarch64|arm64) echo "aarch64-linux-gnu" ;;
+    armv7l|armv7)  echo "armv7-linux-gnueabihf" ;;
+    i686|i386)     echo "i686-linux-gnu" ;;
+    riscv64)       echo "riscv64-linux-gnu" ;;
+    *) err "unsupported architecture: ${arch}"; exit 1 ;;
+  esac
 }
 
-# ── Determine install paths ──
-install_paths() {
-    local user_mode="$1"
-    if [ "$user_mode" = "user" ]; then
-        BINDIR="${HOME}/.local/bin"
-        SPMD_BINDIR="/usr/local/bin"
-        SUDO="sudo"
-    else
-        BINDIR="/usr/local/bin"
-        SPMD_BINDIR="/usr/local/bin"
-        SUDO=""
-    fi
+# ── Welcome banner ──
+printf "\n${BOLD}${MAGENTA}" >&2
+printf "  ╔══════════════════════════════╗\n" >&2
+printf "  ║   SPM — Samad Package Mgr    ║\n" >&2
+printf "  ║   Installer v${VERSION#v}${NC}${BOLD}${MAGENTA}            ║\n" >&2
+printf "  ║   ${NC}${DIM}github.com/Aloosh101/...${NC}${BOLD}${MAGENTA}   ║\n" >&2
+printf "  ╚══════════════════════════════╝${NC}\n" >&2
+
+if [ -z "$USER_MODE" ]; then
+  block "System-wide install" \
+    "spm + spmd  →  /usr/local/bin" \
+    "Use ${BOLD}--user${NC} for ~/.local/bin"
+else
+  block "User install" \
+    "spm  →  ${HOME}/.local/bin" \
+    "spmd →  /usr/local/bin  (needs sudo)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Step 1 — Environment checks
+# ═══════════════════════════════════════════════════════════════════
+step 1 "Environment"
+
+if [ -z "$USER_MODE" ]; then
+  if [ "$(id -u)" -ne 0 ]; then
+    err "root required for system-wide install"
+    err "re-run: ${BOLD}sudo bash install.sh${NC}"
+    err "or:    ${BOLD}bash install.sh --user${NC}"
+    exit 1
+  fi
+  ok "root privileges confirmed"
+else
+  ok "user: $(whoami)"
+fi
+
+if command -v curl &>/dev/null; then
+  ok "curl available"
+elif command -v wget &>/dev/null; then
+  ok "wget available"
+else
+  err "need curl or wget — install one and re-run"
+  exit 1
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Step 2 — System detection
+# ═══════════════════════════════════════════════════════════════════
+step 2 "System"
+
+ARCH="$(detect_arch)"
+ok "architecture: ${BOLD}${ARCH}${NC}"
+
+DISTRO="$( (source /etc/os-release 2>/dev/null && echo "${ID}") || echo "linux")"
+KERNEL="$(uname -sr)"
+info "distro: ${DISTRO}  ·  kernel: ${KERNEL}"
+
+# ═══════════════════════════════════════════════════════════════════
+# Step 3 — Download binaries
+# ═══════════════════════════════════════════════════════════════════
+step 3 "Download"
+
+GH="https://github.com/Aloosh101/Samad-Package-Manager/releases"
+if [ "$VERSION" = "latest" ]; then
+  BASE="${GH}/latest/download"
+else
+  BASE="${GH}/download/${VERSION}"
+fi
+
+# download name → prints dest path to stdout; all diagnostics to stderr
+download() {
+  local name="$1"
+  local dest="/tmp/${name}"
+  local url="${BASE}/${name}"
+
+  detail "source: ${DIM}${url}${NC}"
+
+  # Fetch content-length for size hint
+  local size_hint
+  size_hint=$(curl -sI "$url" 2>/dev/null \
+    | grep -i '^content-length:' \
+    | awk '{printf "%.1f MB", $2/1048576}')
+  if [ -n "$size_hint" ]; then
+    detail "size: ${CYAN}${size_hint}${NC}"
+  fi
+
+  if command -v curl &>/dev/null; then
+    curl -fL --progress-bar "$url" -o "$dest"
+  else
+    wget -q --show-progress "$url" -O "$dest"
+  fi
+
+  if [ ! -s "$dest" ]; then
+    err "download failed: ${name}"
+    exit 1
+  fi
+
+  local file_size
+  file_size=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null || echo 0)
+  if [ "$file_size" -gt 0 ]; then
+    local size_display
+    size_display=$(echo "$file_size" | awk '{printf "%.1f MB", $1/1048576}')
+    ok "${name} downloaded  ${DIM}(${size_display})${NC}"
+  else
+    ok "${name} downloaded"
+  fi
+
+  chmod +x "$dest"
+  printf "%s" "$dest"
 }
 
-# ── Download with progress ──
-download_release() {
-    local version="$1"
-    local binary="$2"
-    local url
-
-    if [ "$version" = "latest" ]; then
-        url="https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/${binary}"
-    else
-        url="https://github.com/Aloosh101/Samad-Package-Manager/releases/download/${version}/${binary}"
-    fi
-
-    info "Fetching: ${DIM}${url}${NC}"
-
-    if command -v curl &>/dev/null; then
-        curl -fL --progress-bar "$url" -o "/tmp/${binary}" 2>&1 | while IFS= read -r line; do
-            if [[ "$line" =~ [0-9]+% ]]; then
-                printf "  ${CYAN}⬇${NC} ${DIM}Downloading: %s${NC}\r" "$line"
-            fi
-        done
-        printf "  ${GREEN}✔${NC} ${DIM}Downloaded: ${binary}${NC}  \n"
-    elif command -v wget &>/dev/null; then
-        info "Downloading with wget... (no progress bar)"
-        wget -q --show-progress "$url" -O "/tmp/${binary}" 2>&1
-        ok "Downloaded: ${binary}"
-    else
-        err "Neither curl nor wget found. Install one and try again."
-        exit 1
-    fi
-
-    if [ ! -s "/tmp/${binary}" ]; then
-        err "Download failed — file is empty"
-        exit 1
-    fi
-
-    local size
-    size=$(stat -c%s "/tmp/${binary}" 2>/dev/null || stat -f%z "/tmp/${binary}" 2>/dev/null || echo "?")
-    if [ "$size" != "?" ]; then
-        size=$(echo "$size" | awk '{printf "%.1f MB", $1/1048576}')
-        detail "Size: ${size}"
-    fi
-
-    chmod +x "/tmp/${binary}"
-    echo "/tmp/${binary}"
-}
-
-# ── Verify checksum ──
+# ── Checksum verification ──
 verify_checksum() {
-    local binary_path="$1"
-    local binary_name="$2"
-    local version="$3"
-
-    local checksums_url
-    if [ "$version" = "latest" ]; then
-        checksums_url="https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/checksums.txt"
+  local bin_path="$1" bin_name="$2"
+  if ! command -v sha256sum &>/dev/null; then
+    detail "sha256sum not available — skipping verification"
+    return
+  fi
+  local checksums_url="${BASE}/checksums.txt"
+  local expected
+  if curl -fsSL "$checksums_url" -o /tmp/checksums.txt 2>/dev/null; then
+    expected=$(awk -v name="  ${bin_name}$" '$0 ~ name {print $1}' /tmp/checksums.txt)
+    if [ -n "$expected" ]; then
+      local actual
+      actual=$(sha256sum "$bin_path" | awk '{print $1}')
+      if [ "$expected" != "$actual" ]; then
+        err "checksum mismatch for ${bin_name}"
+        detail "expected: ${expected}"
+        detail "actual:   ${actual}"
+        exit 1
+      fi
+      ok "${bin_name} checksum verified"
     else
-        checksums_url="https://github.com/Aloosh101/Samad-Package-Manager/releases/download/${version}/checksums.txt"
+      detail "no checksum entry for ${bin_name} — skipping"
     fi
-
-    if ! command -v sha256sum &>/dev/null; then
-        detail "sha256sum not available — skipping verification"
-        return
-    fi
-
-    local expected
-    if curl -fsSL "$checksums_url" -o "/tmp/checksums.txt" 2>/dev/null; then
-        expected=$(grep "  ${binary_name}$" "/tmp/checksums.txt" | awk '{print $1}' || true)
-        if [ -n "$expected" ]; then
-            local actual
-            actual=$(sha256sum "$binary_path" | awk '{print $1}')
-            if [ "$expected" != "$actual" ]; then
-                err "Checksum mismatch! Expected: ${expected}"
-                err "Actual:   ${actual}"
-                exit 1
-            fi
-            ok "Checksum verified"
-        else
-            detail "No checksum found for ${binary_name} — skipping verification"
-        fi
-        rm -f "/tmp/checksums.txt"
-    else
-        detail "Could not fetch checksums — skipping verification"
-    fi
+  else
+    detail "could not fetch checksums — skipping"
+  fi
+  rm -f /tmp/checksums.txt
 }
 
-# ── Check if already installed ──
-check_existing() {
-    local dest="$1"
-    local binary="$2"
-    if [ -f "${dest}/${binary}" ]; then
-        local old_ver
-        old_ver=$("${dest}/${binary}" --version 2>/dev/null || echo "unknown")
-        detail "Found existing: ${dest}/${binary} (${old_ver})"
-    fi
+BIN_NAME="spm-${ARCH}"
+BIN_DNAME="spmd-${ARCH}"
+
+DL_SPM=$(download "$BIN_NAME")
+verify_checksum "$DL_SPM" "$BIN_NAME"
+
+DL_SPMD=$(download "$BIN_DNAME")
+verify_checksum "$DL_SPMD" "$BIN_DNAME"
+
+# ═══════════════════════════════════════════════════════════════════
+# Step 4 — Install binaries
+# ═══════════════════════════════════════════════════════════════════
+step 4 "Install"
+
+if [ -z "$USER_MODE" ]; then
+  BINDIR="/usr/local/bin"
+  SUDO=""
+else
+  BINDIR="${HOME}/.local/bin"
+  SUDO="sudo"
+fi
+
+install_bin() {
+  local src="$1" name="$2" dest="$3" sudo_cmd="$4"
+  if [ -f "${dest}/${name}" ]; then
+    local old_ver
+    old_ver=$("${dest}/${name}" --version 2>/dev/null || echo "unknown")
+    detail "replacing existing: ${dest}/${name} (${old_ver})"
+  fi
+  ${sudo_cmd} mkdir -p "$dest"
+  ${sudo_cmd} cp -f "$src" "${dest}/${name}"
+  ${sudo_cmd} chmod 755 "${dest}/${name}"
+  ok "${BOLD}${name}${NC} → ${CYAN}${dest}/${name}${NC}"
 }
 
-# ── Install binary ──
-install_binary() {
-    local binary_path="$1"
-    local binary_name="$2"
-    local dest="$3"
-    local sudo_cmd="$4"
+install_bin "$DL_SPM"  "spm"  "$BINDIR" "$SUDO"
+install_bin "$DL_SPMD" "spmd" "/usr/local/bin" "$SUDO"
 
-    info "Installing: ${DIM}${binary_name} → ${dest}/${binary_name}${NC}"
-    $sudo_cmd mkdir -p "$dest"
-    $sudo_cmd cp -f "$binary_path" "${dest}/${binary_name}"
-    $sudo_cmd chmod 755 "${dest}/${binary_name}"
+# Symlink /usr/bin/spm for sudo PATH (root mode only)
+if [ -z "$USER_MODE" ] && [ ! -L /usr/bin/spm ]; then
+  ln -sf /usr/local/bin/spm /usr/bin/spm 2>/dev/null \
+    && detail "symlink: /usr/bin/spm → /usr/local/bin/spm" \
+    || true
+fi
 
-    # Create /usr/bin symlink for sudo PATH (root mode)
-    if [ "$binary_name" = "spm" ] && [ "$dest" = "/usr/local/bin" ] && [ -z "$sudo_cmd" ]; then
-        if [ ! -L /usr/bin/spm ] || [ "$(readlink /usr/bin/spm)" != "/usr/local/bin/spm" ]; then
-            $sudo_cmd ln -sf /usr/local/bin/spm /usr/bin/spm
-            detail "Symlinked: /usr/bin/spm → /usr/local/bin/spm"
-        fi
-    fi
+# ═══════════════════════════════════════════════════════════════════
+# Step 5 — Finalize
+# ═══════════════════════════════════════════════════════════════════
+step 5 "Finalize"
 
-    ok "${binary_name} installed → ${dest}/${binary_name}"
-}
+VER="v${VERSION#v}"
+if command -v spm &>/dev/null; then
+  VER=$(spm --version 2>/dev/null || echo "$VER")
+fi
 
-# ── Cleanup ──
-cleanup() {
-    rm -f /tmp/spm-* /tmp/spmd-* /tmp/checksums.txt 2>/dev/null || true
-}
+if ${SUDO} spm init &>/dev/null; then
+  ok "spm init completed"
+else
+  detail "spm init skipped — run ${BOLD}spm init${NC} manually"
+fi
 
-# ── Main ──
-main() {
-    local user_mode=""
-    local version="latest"
-    local arch
-
-    # Trap for cleanup
-    trap cleanup EXIT
-
-    # Parse args
-    for arg in "$@"; do
-        case "$arg" in
-            --help|-h) usage ;;
-            --user)    user_mode="user" ;;
-            --version=*) version="${arg#*=}" ;;
-            --version) ;;
-        esac
-    done
-
-    # ── Welcome ──
-    printf "\n"
-    header "SPM Installer — v${version#v}"
-    if [ -z "$user_mode" ]; then
-        echo "  System-wide install  │  ${CYAN}spm${NC} + ${CYAN}spmd${NC} → /usr/local/bin"
-        printf "\n"
-        printf "  ${DIM}Use ${NC}--user${DIM} for user install (${NC}~/.local/bin${DIM})${NC}\n"
-    else
-        echo "  User install         │  ${CYAN}spm${NC} → ~/.local/bin  ·  ${CYAN}spmd${NC} → /usr/local/bin"
-    fi
-    printf "\n"
-
-    # ── Step 1: Check permissions ──
-    step "1 of 5 — Checking environment"
-    if [ -z "$user_mode" ]; then
-        if [ "$(id -u)" -ne 0 ]; then
-            err "Root install requires root privileges."
-            err "Re-run: ${BOLD}sudo bash install.sh${NC}"
-            err "Or:     ${BOLD}bash install.sh --user${NC}"
-            exit 1
-        fi
-        user_mode="root"
-        ok "Running as root"
-    else
-        ok "Running as user: $(whoami)"
-    fi
-
-    # ── Step 2: Detect architecture ──
-    step "2 of 5 — Detecting system"
-    arch="$(detect_arch)"
-    ok "Architecture: ${arch}"
-
-    local os_info
-    os_info="$(uname -sr)"
-    detail "Kernel: ${os_info}"
-
-    # ── Step 3: Download binaries ──
-    step "3 of 5 — Downloading binaries"
-
-    local bin_name="spm-${arch}"
-    local bin_name_d="spmd-${arch}"
-
-    # Download spm
-    info "Binary: ${bin_name}"
-    local dl_path
-    dl_path=$(download_release "$version" "$bin_name")
-    verify_checksum "$dl_path" "$bin_name" "$version"
-
-    # Download spmd
-    info "Binary: ${bin_name_d}"
-    local dl_path_d
-    dl_path_d=$(download_release "$version" "$bin_name_d")
-    verify_checksum "$dl_path_d" "$bin_name_d" "$version"
-
-    # ── Step 4: Install ──
-    step "4 of 5 — Installing"
-    install_paths "$user_mode"
-
-    check_existing "$BINDIR" "spm"
-    install_binary "$dl_path" "spm" "$BINDIR" "$SUDO"
-
-    check_existing "$SPMD_BINDIR" "spmd"
-    install_binary "$dl_path_d" "spmd" "$SPMD_BINDIR" "$SUDO"
-
-    # Clean up downloaded files
-    cleanup
-
-    # ── Step 5: Post-install ──
-    step "5 of 5 — Finalizing"
-
-    if command -v spm &>/dev/null; then
-        local ver
-        ver=$(spm --version 2>/dev/null || echo "v${version#v}")
-        ok "SPM ${ver} is ready"
-    else
-        detail "Run ${BOLD}hash -r${NC} or restart your shell to use spm"
-    fi
-
-    # Run spm init in background
-    if $SUDO spm init &>/dev/null; then
-        ok "spm init completed"
-    else
-        detail "spm init skipped (run manually: ${BOLD}spm init${NC})"
-    fi
-
-    # ── Summary ──
-    printf "\n"
-    header "Installation complete"
-    echo "  ${GREEN}spm${NC}  → ${BOLD}${BINDIR}/spm${NC}"
-    echo "  ${GREEN}spmd${NC} → ${BOLD}${SPMD_BINDIR}/spmd${NC}"
-    printf "\n"
-    echo "  ${BOLD}Next steps:${NC}"
-    echo "    ${CYAN}1.${NC} ${DIM}spm repo add debian --source deb \\"
-    echo "         --mirrors https://deb.debian.org/debian \\"
-    echo "         --codename stable --components main${NC}"
-    echo "    ${CYAN}2.${NC} ${DIM}spm update${NC}"
-    echo "    ${CYAN}3.${NC} ${DIM}spm install figlet${NC}"
-    printf "\n"
-    echo "  ${DIM}Need help?  spm --help${NC}"
-    printf "\n"
-}
-
-main "$@"
+# ═══════════════════════════════════════════════════════════════════
+printf "\n${BOLD}${GREEN}" >&2
+printf "  ╔══════════════════════════════╗\n" >&2
+printf "  ║   SPM ${VER} installed!       ║\n" >&2
+printf "  ╚══════════════════════════════╝${NC}\n" >&2
+printf "\n" >&2
+block "Next steps" \
+  "${CYAN}spm repo add debian --source deb --mirrors https://deb.debian.org/debian --codename stable --components main${NC}" \
+  "${CYAN}spm update${NC}" \
+  "${CYAN}spm install figlet${NC}"
+printf "\n" >&2
+printf "${DIM}  Need help?  spm --help${NC}\n" >&2
+printf "\n" >&2
