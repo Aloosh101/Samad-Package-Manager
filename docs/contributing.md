@@ -3,7 +3,7 @@
 ## Development Setup
 
 ```bash
-git clone https://github.com/aloosh101/spm
+git clone https://github.com/Aloosh101/Samad-Package-Manager
 cd spm
 
 # Check the code compiles

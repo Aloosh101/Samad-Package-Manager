@@ -4,9 +4,9 @@ set -euo pipefail
 # install.sh — Install SPM binary from GitHub Releases
 #
 # Usage:
-#   curl -fsSL https://github.com/aloosh101/spm/releases/latest/download/install.sh | sudo bash
-#   curl -fsSL https://github.com/aloosh101/spm/releases/latest/download/install.sh | bash -s -- --user
-#   curl -fsSL https://github.com/aloosh101/spm/releases/latest/download/install.sh | bash -s -- --version v0.3.0
+#   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | sudo bash
+#   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | bash -s -- --user
+#   curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | bash -s -- --version v0.3.0
 #
 # Options:
 #   --user          Install to ~/.local/bin instead of /usr/local/bin
@@ -74,9 +74,9 @@ download_release() {
     local url
 
     if [ "$version" = "latest" ]; then
-        url="https://github.com/aloosh101/spm/releases/latest/download/${binary}"
+        url="https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/${binary}"
     else
-        url="https://github.com/aloosh101/spm/releases/download/${version}/${binary}"
+        url="https://github.com/Aloosh101/Samad-Package-Manager/releases/download/${version}/${binary}"
     fi
 
     info "Downloading: ${url}"

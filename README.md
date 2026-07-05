@@ -21,7 +21,7 @@ SPM manages packages from `.deb`, `.rpm`, and its native `.sam` formats through 
 ## Quick Install
 
 ```bash
-curl -fsSL https://github.com/aloosh101/spm/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | sudo bash
 ```
 
 This auto-detects your architecture and installs the pre-built binary. No Rust toolchain required.
@@ -67,7 +67,7 @@ This auto-detects your architecture and installs the pre-built binary. No Rust t
 
 ```bash
 # Install
-curl -fsSL https://github.com/aloosh101/spm/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/Aloosh101/Samad-Package-Manager/releases/latest/download/install.sh | sudo bash
 
 # Add Debian repo
 spm repo add debian --source deb \
@@ -86,7 +86,7 @@ spm install figlet
 ## Build from Source
 
 ```bash
-git clone https://github.com/aloosh101/spm && cd spm
+git clone https://github.com/Aloosh101/Samad-Package-Manager && cd spm
 cargo build --release
 sudo cp target/release/spm /usr/local/bin/spm
 sudo cp target/release/spmd /usr/local/bin/spmd
