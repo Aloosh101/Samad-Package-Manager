@@ -248,13 +248,34 @@ pub fn set_no_new_privs() -> Result<(), std::io::Error> {
 #[cfg(target_os = "linux")]
 pub fn drop_all_capabilities() -> Result<(), std::io::Error> {
     for cap in 0..64u64 {
-        unsafe {
-            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0);
+        let ret = unsafe {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0)
+        };
+        if ret != 0 {
+            // If the capability doesn't exist (invalid cap), that's fine
+            if unsafe { *libc::__errno_location() } != libc::EINVAL {
+                return Err(std::io::Error::last_os_error());
+            }
         }
     }
-    caps::clear(None, caps::CapSet::Inheritable).ok();
-    caps::clear(None, caps::CapSet::Permitted).ok();
-    caps::clear(None, caps::CapSet::Effective).ok();
+    // Verify bounding set is empty
+    for cap in 0..64u64 {
+        let ret = unsafe {
+            libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0)
+        };
+        if ret == 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("capability {cap} still in bounding set after drop"),
+            ));
+        }
+    }
+    caps::clear(None, caps::CapSet::Inheritable)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    caps::clear(None, caps::CapSet::Permitted)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    caps::clear(None, caps::CapSet::Effective)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     Ok(())
 }
 

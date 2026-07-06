@@ -484,10 +484,6 @@ fn peer_cred(stream: &UnixStream) -> SpmResult<(u32, u32)> {
 }
 
 fn is_authorized(uid: u32) -> bool {
-    // Allow all operations when SPM_NO_AUTH is set (testing/dev mode)
-    if std::env::var("SPM_NO_AUTH").as_deref() == Ok("1") {
-        return true;
-    }
     if uid == 0 {
         return true;
     }
@@ -741,8 +737,8 @@ pub async fn run_daemon() -> SpmResult<()> {
         let l = UnixListener::bind(&sock)
             .map_err(|e| SpmError::other(format!("Cannot bind to {sock}: {e}")))?;
 
-        // Set permissions to 666 so non-root users can connect (authorization is via peer creds)
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666))
+        // Only spm group members can connect (authorization is via peer creds)
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))
             .map_err(|e| SpmError::other(format!("Cannot set socket permissions: {e}")))?;
 
         l

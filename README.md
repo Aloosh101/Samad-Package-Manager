@@ -1,7 +1,7 @@
 # SPM — Samad Package Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.2-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.3-blue" alt="Version">
   <img src="https://img.shields.io/badge/rustc-2021+-orange" alt="Rust Edition">
   <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-green" alt="License">
   <img src="https://img.shields.io/badge/status-beta-green" alt="Status">

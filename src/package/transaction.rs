@@ -877,7 +877,16 @@ impl Drop for RollbackGuard {
         for s in &self.symlinks {
             let _ = fs::remove_file(&s.fhs_path);
             if let Some(parent) = s.fhs_path.parent() {
-                let _ = fs::remove_dir(parent);
+                // Only remove parent dir if it's empty — guards against
+                // TOCTOU races with concurrent transactions.
+                if parent.exists() {
+                    let empty = parent.read_dir()
+                        .map(|mut i| i.next().is_none())
+                        .unwrap_or(false);
+                    if empty {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
             }
         }
         if let Some(ref hash) = self.store_hash {
