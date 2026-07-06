@@ -497,7 +497,7 @@ fn is_authorized(uid: u32) -> bool {
         None => return false,
     };
     // Call getgrouplist(3) to get all supplementary groups
-    let c_username = std::ffi::CString::new(username).unwrap();
+    let c_username = std::ffi::CString::new(username.as_str()).unwrap();
     let mut ngroups: libc::c_int = 0;
     // First call to get the size
     let ret = unsafe {
@@ -517,15 +517,12 @@ fn is_authorized(uid: u32) -> bool {
             }
         }
     }
-    // Also check primary group
-    let passwd = unsafe {
-        let pw = libc::getpwnam(c_username.as_ptr());
-        if pw.is_null() {
-            return false;
-        }
-        (*pw).pw_gid
+    // Also check primary group via reentrant API
+    let primary_gid = match nix::unistd::User::from_name(&username) {
+        Ok(Some(user)) => user.gid.as_raw(),
+        _ => return false,
     };
-    passwd == target_gid
+    primary_gid == target_gid
 }
 
 fn resolve_user_name(uid: u32) -> Option<String> {
@@ -704,8 +701,26 @@ fn try_systemd_socket_activation() -> Option<std::os::unix::net::UnixListener> {
     }
 
     // SD_LISTEN_FDS_START is always 3
+    // Verify fd 3 is a Unix socket before taking ownership
+    let mut sock_type: libc::c_int = 0;
+    let mut sock_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            3,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sock_type as *mut _ as *mut libc::c_void,
+            &mut sock_len,
+        )
+    };
+    if rc != 0 || sock_type != libc::SOCK_STREAM {
+        tracing::error!("fd 3 is not a stream socket; systemd socket activation rejected");
+        return None;
+    }
+
     use std::os::unix::io::FromRawFd;
     // SAFETY: systemd passes the fd at SD_LISTEN_FDS_START.
+    // We verified fd 3 is a SOCK_STREAM Unix socket.
     // We take ownership of the fd — systemd expects this.
     let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
 

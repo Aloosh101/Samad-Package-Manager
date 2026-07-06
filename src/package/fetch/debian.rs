@@ -86,8 +86,30 @@ pub fn fetch_debian_package(
         ))
     })?;
 
+    let expected_sha256 = entry.get("SHA256").and_then(|s| {
+        s.lines().find_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 && *parts[2] == *filename {
+                Some(parts[0].to_string())
+            } else {
+                None
+            }
+        })
+    });
+
     let deb_url = format!("{base}/{filename}");
-    download_bytes(&deb_url)
+    let body = download_bytes(&deb_url)?;
+
+    if let Some(ref expected) = expected_sha256 {
+        let actual = crate::util::hash::sha256_hex(&body);
+        if actual != *expected {
+            return Err(SpmError::other(format!(
+                "SHA256 mismatch for '{name}': expected {expected}, got {actual}"
+            )));
+        }
+    }
+
+    Ok(body)
 }
 
 fn download_bytes(url: &str) -> SpmResult<Vec<u8>> {

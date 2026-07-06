@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::types::PackageId;
@@ -86,14 +87,12 @@ impl Default for DependencyCache {
     }
 }
 
-static mut GLOBAL_CACHE_EPOCH: u64 = 0;
+static GLOBAL_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump_dep_cache_epoch() {
-    unsafe {
-        GLOBAL_CACHE_EPOCH = GLOBAL_CACHE_EPOCH.wrapping_add(1);
-    }
+    GLOBAL_CACHE_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn current_dep_cache_epoch() -> u64 {
-    unsafe { GLOBAL_CACHE_EPOCH }
+    GLOBAL_CACHE_EPOCH.load(Ordering::Relaxed)
 }

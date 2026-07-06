@@ -262,28 +262,20 @@ fn resolve_user_home(uid: u32) -> Option<String> {
         .map(|u| u.dir.to_string_lossy().into_owned())
 }
 
-fn resolve_supplementary_groups(uid: u32, gid: u32) -> Vec<u32> {
+fn resolve_supplementary_groups(uid: u32, _gid: u32) -> Vec<u32> {
+    use nix::unistd::User;
     let username = match crate::util::user::resolve_user_name(uid) {
         Some(n) => n,
         None => return Vec::new(),
     };
-    let c_username = match std::ffi::CString::new(username) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    // Use nix::unistd::User::from_name for a thread-safe lookup
+    let user = match User::from_name(&username) {
+        Ok(Some(u)) => u,
+        _ => return Vec::new(),
     };
-    let mut ngroups: libc::c_int = 0;
-    let ret =
-        unsafe { libc::getgrouplist(c_username.as_ptr(), gid, std::ptr::null_mut(), &mut ngroups) };
-    if ret == -1 && ngroups > 0 {
-        let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
-        let ret = unsafe {
-            libc::getgrouplist(c_username.as_ptr(), gid, groups.as_mut_ptr(), &mut ngroups)
-        };
-        if ret != -1 {
-            return groups.into_iter().map(|g| g as u32).collect();
-        }
-    }
-    Vec::new()
+    // Return primary group as the minimal set; supplementary groups
+    // are resolved via the daemon's is_authorized check using getgrouplist.
+    vec![user.gid.as_raw()]
 }
 
 fn is_spm_managed_path(path: &str) -> bool {

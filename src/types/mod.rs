@@ -148,7 +148,7 @@ mod tests {
             distro: Some("ubuntu".into()),
             codename: Some("noble".into()),
             components: Some(vec!["main".into(), "universe".into()]),
-            mirrors: Some(vec!["http://archive.ubuntu.com/ubuntu".into()]),
+            mirrors: Some(vec!["https://archive.ubuntu.com/ubuntu".into()]),
             release: None,
             repos: None,
             url: None,

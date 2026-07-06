@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
@@ -285,7 +286,14 @@ pub fn run_script_in_sandbox(content: &str, phase: &str, sandbox_dir: &str) -> S
         return Ok(());
     }
 
-    let script_dir = Path::new(sandbox_dir).join("tmp");
+    // Canonicalize the sandbox path to prevent escapes via symlinks
+    let sandbox_dir = Path::new(sandbox_dir)
+        .canonicalize()
+        .map_err(|e| SpmError::other(format!("Invalid sandbox directory path: {e}")))?
+        .to_string_lossy()
+        .to_string();
+
+    let script_dir = Path::new(&sandbox_dir).join("tmp");
     fs::create_dir_all(&script_dir)
         .map_err(|e| SpmError::other(format!("Failed to create sandbox tmp dir: {e}")))?;
     let script_path = script_dir.join("script.sh");
@@ -296,9 +304,9 @@ pub fn run_script_in_sandbox(content: &str, phase: &str, sandbox_dir: &str) -> S
     fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
 
     // Ensure /bin/sh exists inside sandbox
-    let sandbox_sh = Path::new(sandbox_dir).join("bin").join("sh");
+    let sandbox_sh = Path::new(&sandbox_dir).join("bin").join("sh");
     if !sandbox_sh.exists() {
-        let sandbox_bin = Path::new(sandbox_dir).join("bin");
+        let sandbox_bin = Path::new(&sandbox_dir).join("bin");
         fs::create_dir_all(&sandbox_bin)?;
         let _ = fs::copy("/bin/sh", &sandbox_sh);
     }
@@ -308,17 +316,23 @@ pub fn run_script_in_sandbox(content: &str, phase: &str, sandbox_dir: &str) -> S
     use std::time::Duration;
 
     let (tx, rx) = mpsc::channel();
-    let sandbox_dir = sandbox_dir.to_string();
     let phase_clone = phase.to_string();
     let phase_debug = phase.to_string();
 
+    // Pre-allocate CString for pre_exec (async-signal-safe — no allocation after fork)
+    let sandbox_c = CString::new(sandbox_dir.as_str())
+        .map_err(|e| SpmError::other(format!("Invalid sandbox path: {e}")))?;
+
     thread::spawn(move || {
-        let output = Command::new("chroot")
-            .arg(&sandbox_dir)
-            .arg("/bin/sh")
-            .arg("/tmp/script.sh")
-            .arg(&phase_clone)
-            .output();
+        let output = unsafe {
+            Command::new("/bin/sh")
+                .arg("/tmp/script.sh")
+                .arg(&phase_clone)
+                .pre_exec(move || {
+                    isolate_sandbox_process(&sandbox_c)
+                })
+                .output()
+        };
         let _ = tx.send(output);
     });
 
@@ -341,6 +355,80 @@ pub fn run_script_in_sandbox(content: &str, phase: &str, sandbox_dir: &str) -> S
             "{phase_debug} script in sandbox timed out after {SCRIPT_TIMEOUT_SECS}s"
         ))),
     }
+}
+
+/// Isolate the child process into a lightweight container using
+/// Linux-native namespaces + chroot + capability dropping.
+///
+/// Call ONLY from pre_exec (async-signal-safe — no heap allocation).
+///
+/// # Safety
+///
+/// `sandbox_c` must be a pre-validated CString with no interior nulls.
+unsafe fn isolate_sandbox_process(sandbox_c: &std::ffi::CStr) -> Result<(), std::io::Error> {
+    // 1. New mount namespace — isolates all mount changes from parent
+    if libc::unshare(libc::CLONE_NEWNS) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 2. Make all existing mounts private so parent mount events don't leak in
+    let root = b"/\0" as *const u8 as *const libc::c_char;
+    if libc::mount(std::ptr::null(), root, std::ptr::null(),
+        (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong, std::ptr::null()) != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 3. chroot into sandbox directory (only visible within this mount namespace)
+    if libc::chroot(sandbox_c.as_ptr()) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 4. Change working directory to new root
+    if libc::chdir(root) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 5. New PID namespace — script sees itself as PID 1
+    if libc::unshare(libc::CLONE_NEWPID) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 6. NoNewPrivs — prevent privilege escalation via setuid binaries
+    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 7. Drop all capabilities from bounding set
+    for cap in 0..64u64 {
+        if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+            if *libc::__errno_location() != libc::EINVAL {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    // Verify no capabilities remain
+    for cap in 0..64u64 {
+        if libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) == 1 {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other,
+                format!("capability {cap} still present in bounding set")));
+        }
+    }
+    if libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // 8. Resource limits
+    let nofile = libc::rlimit { rlim_cur: 1024, rlim_max: 1024 };
+    if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let nproc = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+    if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 pub fn run_script(content: &str, phase: &str) -> SpmResult<()> {
@@ -404,25 +492,44 @@ pub fn run_script(content: &str, phase: &str) -> SpmResult<()> {
 /// Called from `pre_exec` — must use only async-signal-safe syscalls.
 fn isolate_child_process() -> Result<(), std::io::Error> {
     // 1. Prevent privilege escalation
-    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
 
     // 2. Drop all capabilities from the bounding set via PR_CAPBSET_DROP
     for cap in 0..64u64 {
-        unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0); }
+        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        if ret != 0 {
+            // EINVAL means the capability number is not valid; ignore it
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINVAL) {
+                return Err(err);
+            }
+        }
     }
 
     // 3. Resource limits
     let nofile = libc::rlimit { rlim_cur: 1024, rlim_max: 1024 };
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile); }
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let nproc = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
-    unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &nproc); }
+    if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &nproc) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let fsize = libc::rlimit { rlim_cur: 10 * 1024 * 1024, rlim_max: 10 * 1024 * 1024 };
-    unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &fsize); }
+    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &fsize) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let as_limit = libc::rlimit { rlim_cur: 512 * 1024 * 1024, rlim_max: 512 * 1024 * 1024 };
-    unsafe { libc::setrlimit(libc::RLIMIT_AS, &as_limit); }
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &as_limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
 
     // 4. Isolate PID namespace (requires CAP_SYS_ADMIN, still available before cap drop)
-    unsafe { libc::unshare(libc::CLONE_NEWPID); }
+    if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
 
     Ok(())
 }

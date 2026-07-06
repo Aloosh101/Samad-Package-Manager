@@ -26,22 +26,20 @@ fn send_progress(uid: u32, msg: String) {
     }
 }
 
-static CURRENT_UID: LazyLock<Mutex<Option<u32>>> = LazyLock::new(|| Mutex::new(None));
+thread_local! {
+    static CURRENT_UID: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
+}
 
 pub fn set_current_uid(uid: u32) {
-    if let Ok(mut guard) = CURRENT_UID.lock() {
-        *guard = Some(uid);
-    }
+    CURRENT_UID.with(|c| *c.borrow_mut() = Some(uid));
 }
 
 pub fn clear_current_uid() {
-    if let Ok(mut guard) = CURRENT_UID.lock() {
-        *guard = None;
-    }
+    CURRENT_UID.with(|c| *c.borrow_mut() = None);
 }
 
 fn current_uid() -> Option<u32> {
-    CURRENT_UID.lock().ok().and_then(|g| *g)
+    CURRENT_UID.with(|c| *c.borrow())
 }
 
 const RESET: &str = "\x1b[0m";

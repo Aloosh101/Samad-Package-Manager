@@ -54,16 +54,12 @@ pub fn create_btrfs_snapshot(source: &Path, dest_dir: &Path, name: &str) -> SpmR
     args.name[..len].copy_from_slice(&name_bytes[..len]);
 
     // BTRFS_IOC_SNAP_CREATE = _IOWR(0x94, 1, struct btrfs_ioctl_vol_args)
-    const NR: libc::c_ulong = ((3 as libc::c_ulong) << 30)
-        | ((4096 as libc::c_ulong) << 16)
-        | ((0x94 as libc::c_ulong) << 8)
-        | (1 as libc::c_ulong);
+    const NR: libc::c_ulong = 0x50009401;
     let rc = unsafe {
-        libc::syscall(
-            libc::SYS_ioctl,
-            dest_fd.as_raw_fd() as libc::c_long,
-            NR as libc::c_long,
-            &args as *const _ as libc::c_long,
+        libc::ioctl(
+            dest_fd.as_raw_fd(),
+            NR,
+            &args as *const BtrfsVolArgs,
         )
     };
     if rc < 0 {
@@ -95,16 +91,12 @@ pub fn rollback_btrfs_snapshot(snapshot_path: &Path, dest_dir: &Path) -> SpmResu
     let name_bytes = name.as_bytes();
     args.name[..name_bytes.len()].copy_from_slice(name_bytes);
 
-    const NR: libc::c_ulong = ((3 as libc::c_ulong) << 30)
-        | ((4096 as libc::c_ulong) << 16)
-        | ((0x94 as libc::c_ulong) << 8)
-        | (1 as libc::c_ulong);
+    const NR: libc::c_ulong = 0x50009401;
     let rc = unsafe {
-        libc::syscall(
-            libc::SYS_ioctl,
-            dest_fd.as_raw_fd() as libc::c_long,
-            NR as libc::c_long,
-            &args as *const _ as libc::c_long,
+        libc::ioctl(
+            dest_fd.as_raw_fd(),
+            NR,
+            &args as *const BtrfsVolArgs,
         )
     };
     if rc < 0 {

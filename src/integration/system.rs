@@ -104,10 +104,27 @@ pub fn create_tmpfile(path: &Path, mode: u32, owner: &str) -> SpmResult<()> {
         (u, g)
     };
 
+    // Open with O_NOFOLLOW to prevent symlink attacks, then fchown
     let cpath = CString::new(path.to_string_lossy().as_ref())
         .map_err(|e| SpmError::other(format!("Invalid path: {e}")))?;
-    unsafe {
-        libc::chown(cpath.as_ptr(), uid_val, gid_val);
+    let fd = unsafe {
+        libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+    };
+    if fd < 0 {
+        return Err(SpmError::other(format!(
+            "Failed to open {} for ownership change: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let rc = unsafe { libc::fchown(fd, uid_val, gid_val) };
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(SpmError::other(format!(
+            "Failed to change ownership of {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
     }
 
     Ok(())

@@ -51,8 +51,8 @@ pub fn run_in_sandbox(package: &str, command: &[String]) -> SpmResult<()> {
     }
 
     // 1. PID namespace — children become PID 1 in their own tree
-    //    (best-effort; some envs block CLONE_NEWPID)
-    let has_pid_ns = unsafe { libc::unshare(libc::CLONE_NEWPID) } == 0;
+    //    Check availability by reading /proc/self/ns/pid instead of unshare
+    let has_pid_ns = std::path::Path::new("/proc/self/ns/pid").exists();
     if !has_pid_ns {
         tracing::debug!("PID namespace unavailable for sandbox");
     }
@@ -91,13 +91,12 @@ pub fn run_in_sandbox(package: &str, command: &[String]) -> SpmResult<()> {
     };
 
     let (cmd, cmd_args) = if command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         if unsafe { libc::getuid() } == 0 {
             tracing::warn!(
                 "Running interactive shell as root in sandbox. Namespace isolation active."
             );
         }
-        (shell, vec![] as Vec<String>)
+        ("/bin/sh".to_string(), vec![] as Vec<String>)
     } else {
         (command[0].clone(), command[1..].to_vec())
     };
@@ -110,10 +109,13 @@ pub fn run_in_sandbox(package: &str, command: &[String]) -> SpmResult<()> {
         child.env("LD_LIBRARY_PATH", ld_lib);
     }
 
-    // 2–4: Namespace isolation in pre_exec (after fork, before exec)
+    // 2–4: Security isolation in pre_exec (after fork, before exec)
     #[allow(unused_unsafe)]
     unsafe {
         child.pre_exec(|| {
+            use crate::package::sandbox::namespaces;
+
+            // Mount namespace
             if unsafe { libc::unshare(libc::CLONE_NEWNS) } == 0 {
                 unsafe {
                     libc::mount(
@@ -148,6 +150,12 @@ pub fn run_in_sandbox(package: &str, command: &[String]) -> SpmResult<()> {
                     );
                 }
             }
+
+            // Apply additional security measures from the package sandbox
+            namespaces::set_no_new_privs()?;
+            namespaces::drop_all_capabilities()?;
+            namespaces::set_rlimits()?;
+
             Ok(())
         });
     }

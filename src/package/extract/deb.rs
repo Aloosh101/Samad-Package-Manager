@@ -1,5 +1,6 @@
+use std::fs;
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{SpmError, SpmResult};
 
@@ -87,39 +88,89 @@ fn normalize_ar_name(name: &str) -> &str {
     }
 }
 
+fn resolve_safe(entry_parent: &Path, link_target: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components: Vec<Component> = entry_parent.components().collect();
+    for c in link_target.components() {
+        match c {
+            Component::ParentDir => { components.pop(); }
+            Component::Normal(_) => { components.push(c); }
+            _ => {}
+        }
+    }
+    components.iter().collect()
+}
+
+fn extract_safe<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> SpmResult<()> {
+    fs::create_dir_all(dest).map_err(|e| SpmError::other(format!("Failed to create dest dir {:?}: {e}", dest)))?;
+    for entry in archive.entries().map_err(|e| SpmError::compression(format!("Failed to read tar entries: {e}")))? {
+        let mut entry = entry.map_err(|e| SpmError::compression(format!("Failed to read tar entry: {e}")))?;
+        let entry_path = entry.path().map_err(|e| SpmError::compression(format!("Failed to get tar entry path: {e}")))?;
+        let path = entry_path.to_path_buf();
+
+        // Reject entries with parent-dir traversal components in path
+        if path.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(SpmError::invalid_format(format!(
+                "Path traversal in tar entry: {}",
+                path.display()
+            )));
+        }
+
+        // Reject absolute paths (would overwrite system files)
+        if path.is_absolute() {
+            return Err(SpmError::invalid_format(format!(
+                "Absolute path in tar entry: {}",
+                path.display()
+            )));
+        }
+
+        // Check symlink targets for escape attempts
+        let link_target = entry.link_name().map_err(|e| SpmError::compression(format!("Failed to read link name: {e}")))?;
+        if let Some(link) = link_target {
+            if link.is_absolute() {
+                return Err(SpmError::invalid_format(format!(
+                    "Absolute symlink target in tar entry: {} -> {}",
+                    path.display(), link.display()
+                )));
+            }
+            let joined = dest.join(&path);
+            let entry_parent = joined.parent().unwrap_or(dest);
+            let resolved = resolve_safe(entry_parent, &link);
+            if !resolved.starts_with(dest) {
+                return Err(SpmError::invalid_format(format!(
+                    "Symlink escapes destination: {} -> {} (resolves to {})",
+                    path.display(), link.display(), resolved.display()
+                )));
+            }
+        }
+
+        entry.unpack_in(dest).map_err(|e| SpmError::compression(format!("Failed to unpack tar entry {:?}: {e}", path)))?;
+    }
+    Ok(())
+}
+
 fn extract_tar_xz(data: &[u8], dest: &Path) -> SpmResult<()> {
     let mut decoder = xz2::read::XzDecoder::new(data);
     let mut archive = tar::Archive::new(&mut decoder);
-    archive
-        .unpack(dest)
-        .map_err(|e| SpmError::compression(format!("Failed to unpack tar.xz: {e}")))?;
-    Ok(())
+    extract_safe(&mut archive, dest)
 }
 
 fn extract_tar_any(data: &[u8], dest: &Path) -> SpmResult<()> {
     if data.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = flate2::read::GzDecoder::new(data);
         let mut archive = tar::Archive::new(&mut decoder);
-        archive
-            .unpack(dest)
-            .map_err(|e| SpmError::compression(format!("Failed to unpack tar.gz: {e}")))?;
+        extract_safe(&mut archive, dest)
     } else {
         let mut archive = tar::Archive::new(data);
-        archive
-            .unpack(dest)
-            .map_err(|e| SpmError::compression(format!("Failed to unpack tar: {e}")))?;
+        extract_safe(&mut archive, dest)
     }
-    Ok(())
 }
 
 fn extract_tar_zstd(data: &[u8], dest: &Path) -> SpmResult<()> {
     let mut decoder = zstd::Decoder::new(data)
         .map_err(|e| SpmError::compression(format!("Failed to create zstd decoder: {e}")))?;
     let mut archive = tar::Archive::new(&mut decoder);
-    archive
-        .unpack(dest)
-        .map_err(|e| SpmError::compression(format!("Failed to unpack tar.zst: {e}")))?;
-    Ok(())
+    extract_safe(&mut archive, dest)
 }
 
 #[cfg(test)]

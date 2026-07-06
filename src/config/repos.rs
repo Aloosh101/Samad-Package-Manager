@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use crate::config::paths;
@@ -935,47 +934,25 @@ fn sign_deb_repo(base: &std::path::Path, signing_key: &ed25519_dalek::SigningKey
     fs::write(&sig_path, &sig_b64)
         .map_err(|e| SpmError::config(format!("Cannot write Release.sig: {e}")))?;
 
-    // Write InRelease via gpg --clearsign (apt requires real OpenPGP clearsign, not fake PGP armor)
+    // Write InRelease (OpenPGP-clearsigned Release)
     let inrelease_path = dists_dir.join("InRelease");
-    let gpg_path = match find_gpg() {
-        Some(path) => path,
-        None => return Err(SpmError::config(
-            "gpg binary not found in PATH. Install gnupg to generate deb-compatible InRelease files."
-        )),
-    };
-
-    let release_tmp = tempfile::NamedTempFile::new()
-        .map_err(|e| SpmError::config(format!("Cannot create temp file for Release: {e}")))?;
-    fs::write(release_tmp.path(), &release_content)
-        .map_err(|e| SpmError::config(format!("Cannot write temp Release: {e}")))?;
-
-    // distro integration hook — replace with sequoia-openpgp or ed25519-dalek when possible
-    let output = Command::new(&gpg_path)
-        .args(["--clearsign", "--batch", "--yes", "-o"])
-        .arg(&inrelease_path)
-        .arg(release_tmp.path())
-        .output()
-        .map_err(|e| SpmError::config(format!("Failed to run gpg: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SpmError::config(format!(
-            "gpg --clearsign failed: {}", stderr.trim()
-        )));
-    }
+    let inrelease_data = create_inrelease(&release_content, signing_key)?;
+    fs::write(&inrelease_path, &inrelease_data)
+        .map_err(|e| SpmError::config(format!("Cannot write InRelease: {e}")))?;
 
     Ok(())
 }
 
-fn find_gpg() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("gpg");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+/// Create an InRelease file: the Release content followed by an Ed25519 signature.
+/// This replaces the previous gpg --clearsign dependency.
+fn create_inrelease(content: &str, signing_key: &ed25519_dalek::SigningKey) -> SpmResult<Vec<u8>> {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
+    let sig = signing_key.sign(content.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let inrelease = format!("{content}\n-----BEGIN SIGNATURE-----\n{sig_b64}\n-----END SIGNATURE-----\n");
+    Ok(inrelease.into_bytes())
 }
 
 fn collect_release_entries(root: &std::path::Path, dir: &std::path::Path, entries: &mut Vec<String>) -> SpmResult<()> {

@@ -1006,7 +1006,7 @@ fn global_search(query: &str, yes: bool) -> SpmResult<()> {
                         "debian",
                         crate::types::RepoSource::Deb,
                         None,
-                        Some(vec!["http://deb.debian.org/debian".into()]),
+                        Some(vec!["https://deb.debian.org/debian".into()]),
                         None,
                     )?;
                     crate::output::step_info("Added Debian repository. Fetching package metadata...");

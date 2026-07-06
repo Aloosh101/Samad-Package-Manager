@@ -604,8 +604,7 @@ impl HookRunner {
     }
 
     fn run_script(&self, script: &str, args: &[&str]) -> SpmResult<()> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut child = Command::new(&shell)
+        let mut child = Command::new("/bin/sh")
             .arg("-e")
             .arg(script)
             .args(args)

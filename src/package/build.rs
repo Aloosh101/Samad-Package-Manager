@@ -313,8 +313,9 @@ pub fn run_build(path: &Path, output: Option<&str>, sign_key: Option<&str>) -> S
     let config = load_config(&root)?;
 
     if let Some(ref cmd) = config.build.command {
-        crate::output::step_info("Running build command...");
-        // acceptable — build systems inherently need a shell
+        crate::output::step_warn(format!(
+            "Running build command as root: $ {cmd}"
+        ));
         let status = Command::new("sh")
             .args(["-c", cmd])
             .current_dir(&root)

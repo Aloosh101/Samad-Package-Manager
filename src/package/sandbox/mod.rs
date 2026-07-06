@@ -86,38 +86,23 @@ impl SandboxBuilder {
             None
         };
 
-        // Create cgroup before spawning so we can add the PID after
         if let Some(ref limits) = cgroup_limits {
             limits.create()?;
         }
 
+        // Build pre-exec context BEFORE the closure (heap allocation OK here)
+        #[cfg(target_os = "linux")]
+        let pre_data = namespaces::PreExecData::build(&mounts, need_mount, need_user, need_net)
+            .map_err(|e| SpmError::sandbox(format!("Failed to build pre-exec context: {e}")))?;
+
         #[cfg(target_os = "linux")]
         unsafe {
             child.pre_exec({
-                let mounts = mounts.clone();
                 let seccomp = seccomp_profile.clone();
                 let landlock = landlock_rules.clone();
 
                 move || {
-                    namespaces::unshare_namespaces(
-                        need_mount,
-                        need_user,
-                        need_net,
-                    )?;
-
-                    if need_mount {
-                        namespaces::setup_mount_namespace(&mounts)?;
-                    }
-
-                    if need_user {
-                        namespaces::setup_user_namespace()?;
-                    }
-
-                    namespaces::setup_uts_namespace()?;
-
-                    namespaces::set_no_new_privs()?;
-                    namespaces::drop_all_capabilities()?;
-                    namespaces::set_rlimits()?;
+                    namespaces::preexec_run(&pre_data)?;
 
                     if let Some(ref profile) = seccomp {
                         profile.apply()?;

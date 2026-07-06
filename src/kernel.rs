@@ -3,6 +3,33 @@ use std::process::Command;
 
 use crate::error::SpmResult;
 
+/// Try to find a system utility at known absolute paths, falling back to PATH lookup.
+/// Prevents PATH poisoning attacks.
+fn find_system_cmd(name: &str) -> String {
+    let candidates: &[&str] = match name {
+        "dracut" => &["/usr/sbin/dracut", "/usr/bin/dracut"],
+        "update-initramfs" => &["/usr/sbin/update-initramfs", "/usr/bin/update-initramfs"],
+        "mkinitrd" => &["/usr/sbin/mkinitrd", "/usr/bin/mkinitrd"],
+        "dkms" => &["/usr/sbin/dkms", "/usr/bin/dkms"],
+        "bootctl" => &["/usr/bin/bootctl", "/usr/sbin/bootctl"],
+        "grub2-mkconfig" => &["/usr/sbin/grub2-mkconfig", "/usr/bin/grub2-mkconfig"],
+        "grub2-install" => &["/usr/sbin/grub2-install", "/usr/bin/grub2-install"],
+        "update-grub" => &["/usr/sbin/update-grub", "/usr/bin/update-grub"],
+        "grub-install" => &["/usr/sbin/grub-install", "/usr/bin/grub-install"],
+        "grub-mkconfig" => &["/usr/sbin/grub-mkconfig", "/usr/bin/grub-mkconfig"],
+        "lspci" => &["/usr/bin/lspci", "/usr/sbin/lspci"],
+        "lsmod" => &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
+        _ => &[],
+    };
+    for &candidate in candidates {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    // Fallback to PATH lookup
+    name.to_string()
+}
+
 /// Information about an installed kernel
 #[derive(Debug, Clone)]
 pub struct KernelInfo {
@@ -94,7 +121,7 @@ pub fn is_kernel_package(name: &str) -> bool {
 /// Rebuild DKMS modules for all installed kernels
 pub fn rebuild_dkms() {
     // distro integration hook — replace with pure Rust when needed
-    let output = match Command::new("dkms").arg("status").output() {
+    let output = match Command::new(find_system_cmd("dkms")).arg("status").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => {
             tracing::debug!("dkms not available, skipping DKMS rebuild");
@@ -109,11 +136,23 @@ pub fn rebuild_dkms() {
 
     for line in output.lines() {
         let module_ver = line.split(',').next().map(|s| s.trim()).unwrap_or("");
-        if !module_ver.is_empty() {
-            tracing::debug!("Rebuilding DKMS module: {module_ver}");
-            let _ = Command::new("dkms").args(["build", module_ver]).status();
-            let _ = Command::new("dkms").args(["install", module_ver]).status();
+        if module_ver.is_empty() {
+            continue;
         }
+        // Validate module_ver: must match "module_name/version" pattern
+        let parts: Vec<&str> = module_ver.splitn(2, '/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            tracing::warn!("Skipping invalid DKMS module entry: {module_ver}");
+            continue;
+        }
+        // Reject entries with shell metacharacters
+        if module_ver.contains(';') || module_ver.contains('`') || module_ver.contains('$') {
+            tracing::warn!("Skipping suspicious DKMS module entry: {module_ver}");
+            continue;
+        }
+        tracing::debug!("Rebuilding DKMS module: {module_ver}");
+        let _ = Command::new(find_system_cmd("dkms")).args(["build", module_ver]).status();
+        let _ = Command::new(find_system_cmd("dkms")).args(["install", module_ver]).status();
     }
 }
 
@@ -122,27 +161,27 @@ pub fn regenerate_initramfs(version: Option<&str>) {
     // distro integration hooks — replace with pure Rust when needed
     if let Some(ver) = version {
         // Regenerate for a specific kernel
-        if Command::new("dracut").arg("--version").output().is_ok() {
+        if Command::new(find_system_cmd("dracut")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating initramfs for kernel {ver} with dracut");
-            let _ = Command::new("dracut").args(["-f", &format!("/boot/initramfs-{}.img", ver), ver]).status();
-        } else if Command::new("update-initramfs").arg("--version").output().is_ok() {
+            let _ = Command::new(find_system_cmd("dracut")).args(["-f", &format!("/boot/initramfs-{}.img", ver), ver]).status();
+        } else if Command::new(find_system_cmd("update-initramfs")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating initramfs with update-initramfs");
-            let _ = Command::new("update-initramfs").args(["-u", "-k", ver]).status();
-        } else if Command::new("mkinitrd").arg("--version").output().is_ok() {
+            let _ = Command::new(find_system_cmd("update-initramfs")).args(["-u", "-k", ver]).status();
+        } else if Command::new(find_system_cmd("mkinitrd")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating initramfs with mkinitrd");
-            let _ = Command::new("mkinitrd").status();
+            let _ = Command::new(find_system_cmd("mkinitrd")).status();
         }
     } else {
         // Regenerate all
-        if Command::new("dracut").arg("--version").output().is_ok() {
+        if Command::new(find_system_cmd("dracut")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating all initramfs with dracut");
-            let _ = Command::new("dracut").args(["-f", "--regenerate-all"]).status();
-        } else if Command::new("update-initramfs").arg("--version").output().is_ok() {
+            let _ = Command::new(find_system_cmd("dracut")).args(["-f", "--regenerate-all"]).status();
+        } else if Command::new(find_system_cmd("update-initramfs")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating all initramfs with update-initramfs");
-            let _ = Command::new("update-initramfs").arg("-u").status();
-        } else if Command::new("mkinitrd").arg("--version").output().is_ok() {
+            let _ = Command::new(find_system_cmd("update-initramfs")).arg("-u").status();
+        } else if Command::new(find_system_cmd("mkinitrd")).arg("--version").output().is_ok() {
             tracing::debug!("Regenerating initramfs with mkinitrd");
-            let _ = Command::new("mkinitrd").status();
+            let _ = Command::new(find_system_cmd("mkinitrd")).status();
         } else {
             tracing::debug!("No initramfs tool found");
         }
@@ -155,28 +194,28 @@ pub fn update_bootloader() {
     // Try systemd-boot first, then GRUB
     if Path::new("/boot/efi/EFI/systemd").exists() || Path::new("/boot/efi/loader/loader.conf").exists() {
         tracing::debug!("Updating systemd-boot");
-        let _ = Command::new("bootctl").arg("update").status();
+        let _ = Command::new(find_system_cmd("bootctl")).arg("update").status();
         return;
     }
 
-    if Command::new("grub2-mkconfig").arg("--version").output().is_ok() {
+    if Command::new(find_system_cmd("grub2-mkconfig")).arg("--version").output().is_ok() {
         tracing::debug!("Updating GRUB2 config");
-        let _ = Command::new("grub2-mkconfig")
+        let _ = Command::new(find_system_cmd("grub2-mkconfig"))
             .args(["-o", "/boot/grub2/grub.cfg"])
             .status();
         // Install bootloader if needed
         if Path::new("/sys/firmware/efi").exists() {
-            let _ = Command::new("grub2-install").status();
+            let _ = Command::new(find_system_cmd("grub2-install")).status();
         }
-    } else if Command::new("update-grub").output().is_ok() {
+    } else if Command::new(find_system_cmd("update-grub")).output().is_ok() {
         tracing::debug!("Updating GRUB with update-grub");
-        let _ = Command::new("update-grub").status();
+        let _ = Command::new(find_system_cmd("update-grub")).status();
         if Path::new("/sys/firmware/efi").exists() {
-            let _ = Command::new("grub-install").status();
+            let _ = Command::new(find_system_cmd("grub-install")).status();
         }
-    } else if Command::new("grub-mkconfig").arg("--version").output().is_ok() {
+    } else if Command::new(find_system_cmd("grub-mkconfig")).arg("--version").output().is_ok() {
         tracing::debug!("Updating GRUB config with grub-mkconfig");
-        let _ = Command::new("grub-mkconfig")
+        let _ = Command::new(find_system_cmd("grub-mkconfig"))
             .args(["-o", "/boot/grub/grub.cfg"])
             .status();
     } else {
@@ -226,7 +265,7 @@ pub fn detect_gpu() -> SpmResult<Vec<GpuDevice>> {
     let mut gpus = Vec::new();
 
     // distro integration hook — replace with /sys/bus/pci/devices parsing when possible
-    let output = Command::new("lspci")
+    let output = Command::new(find_system_cmd("lspci"))
         .args(["-nn", "-d", "::0300"])
         .output()
         .map_err(|e| crate::error::SpmError::command_failed(
@@ -263,7 +302,7 @@ fn detect_gpu_driver(vendor: &GpuVendor) -> GpuDriver {
     // distro integration hooks — replace with /proc/modules parsing when possible
     match vendor {
         GpuVendor::Nvidia => {
-            if let Ok(o) = Command::new("lsmod").output() {
+            if let Ok(o) = Command::new(find_system_cmd("lsmod")).output() {
                 let out = String::from_utf8_lossy(&o.stdout);
                 if out.contains("nvidia") {
                     if let Ok(v) = std::fs::read_to_string("/proc/driver/nvidia/version") {
@@ -279,7 +318,7 @@ fn detect_gpu_driver(vendor: &GpuVendor) -> GpuDriver {
             GpuDriver::None
         }
         GpuVendor::Amd => {
-            if let Ok(o) = Command::new("lsmod").output() {
+            if let Ok(o) = Command::new(find_system_cmd("lsmod")).output() {
                 let out = String::from_utf8_lossy(&o.stdout);
                 if out.contains("amdgpu") {
                     return GpuDriver::OpenSource { name: "amdgpu".into() };
@@ -291,7 +330,7 @@ fn detect_gpu_driver(vendor: &GpuVendor) -> GpuDriver {
             GpuDriver::None
         }
         GpuVendor::Intel => {
-            if let Ok(o) = Command::new("lsmod").output() {
+            if let Ok(o) = Command::new(find_system_cmd("lsmod")).output() {
                 let out = String::from_utf8_lossy(&o.stdout);
                 if out.contains("i915") {
                     return GpuDriver::OpenSource { name: "i915".into() };

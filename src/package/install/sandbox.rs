@@ -343,9 +343,13 @@ fn setup_symlink_sandbox(name: &str, sandbox_dir: &str) -> SpmResult<()> {
             let entries = fs::read_dir(system_path)?;
             for entry in entries {
                 let entry = entry?;
+                // Skip symlinks to prevent following attacker-controlled links
+                if entry.file_type()?.is_symlink() {
+                    continue;
+                }
                 let path = entry.path();
                 if let Some(name_str) = path.file_name().and_then(|n| n.to_str()) {
-                    if name_str.contains(".so") {
+                    if name_str.ends_with(".so") || name_str.contains(".so.") {
                         let link_path = Path::new(&sandbox_lib_dir).join(name_str);
                         if !link_path.exists() {
                             if let Err(e) = std::os::unix::fs::symlink(&path, &link_path) {
