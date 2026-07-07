@@ -4,13 +4,10 @@ use std::io::{IsTerminal, Write};
 use crate::cli::client;
 use crate::config::repos;
 use crate::error::SpmResult;
-use crate::package::{install, query, sam};
-use crate::sandbox;
-use crate::types::SpmConfig;
-use crate::util::process;
+use crate::package::install;
 
 #[derive(Parser, Debug)]
-#[command(name = "spm", version = "0.2.0", about = "Samad Package Manager")]
+#[command(name = "spm", version = env!("CARGO_PKG_VERSION"), about = "Samad Package Manager")]
 pub struct SpmArgs {
     #[command(subcommand)]
     pub command: SpmCommand,
@@ -315,6 +312,19 @@ pub enum SpmCommand {
         #[arg(long)]
         install_daemon: bool,
     },
+
+    /// Update spm and spmd to the latest version
+    #[command(
+        after_help = "Downloads the latest release binary from GitHub and replaces /usr/bin/spm and /usr/bin/spmd.\nRequires spmd running (root).\n\nExamples:\n  spm self-update                     Update to latest version\n  spm self-update --check             Check for updates without installing\n  spm self-update --version 0.3.4     Update to a specific version"
+    )]
+    SelfUpdate {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+        /// Update to a specific version (e.g. \"0.3.4\")
+        #[arg(long)]
+        version: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -454,37 +464,7 @@ impl SpmArgs {
         is_local_path_string(s) || std::path::Path::new(s).exists()
     }
 
-    fn resolve_mode(
-        cli_prefer_newest: bool,
-        cli_stable_debian: bool,
-        cli_newest_redhat: bool,
-    ) -> (crate::types::VersionStrategy, Option<crate::types::RepoSource>) {
-        // Atomic modes take highest priority
-        if cli_stable_debian {
-            return (crate::types::VersionStrategy::PreferStable, Some(crate::types::RepoSource::Deb));
-        }
-        if cli_newest_redhat {
-            return (crate::types::VersionStrategy::PreferNewest, Some(crate::types::RepoSource::Rpm));
-        }
-        // --prefer-newest or config fallback
-        let strategy = if cli_prefer_newest {
-            crate::types::VersionStrategy::PreferNewest
-        } else if let Ok(cfg) = crate::types::SpmConfig::load() {
-            if cfg.prefer_newest.unwrap_or(false) {
-                crate::types::VersionStrategy::PreferNewest
-            } else {
-                crate::types::VersionStrategy::PreferStable
-            }
-        } else {
-            crate::types::VersionStrategy::PreferStable
-        };
-        (strategy, None)
-    }
-
     pub fn execute(&self) -> SpmResult<()> {
-        // Check backend health at the start of every command
-        crate::backend::show_warnings();
-
         match &self.command {
             SpmCommand::Install {
                 package,
@@ -498,283 +478,349 @@ impl SpmArgs {
                 newest_redhat,
             } => {
                 if let Some(path) = convert_only {
-                    sam::convert_to_sam(path)?;
-                    crate::output::result_message(format!("Converted {} to .sam format", path));
+                    let resp = client::send_command("convert", serde_json::json!({"path": path}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                 } else if sandbox.is_some() {
-                    let (strategy, _preferred_source) = Self::resolve_mode(
-                        *prefer_newest, *stable_debian, *newest_redhat,
-                    );
-                    let sandbox_level = sandbox.as_ref().and_then(|s| s.as_deref()).unwrap_or("standard");
-                    install::install_package(package, Some(sandbox_level), *replace, *yes, *smart, strategy)?;
+                    let level = sandbox.as_ref().and_then(|s| s.as_deref()).unwrap_or("standard");
+                    let resp = client::send_command("install-sandbox", serde_json::json!({
+                        "package": package,
+                        "level": level,
+                        "replace": replace,
+                        "yes": yes,
+                        "smart": smart,
+                        "prefer_newest": prefer_newest,
+                        "stable_debian": stable_debian,
+                        "newest_redhat": newest_redhat,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                 } else if Self::is_local_path(package) {
-                    install::install_local_package(package, *replace, *yes)?;
+                    let resp = client::send_command("install-local", serde_json::json!({
+                        "path": package,
+                        "replace": replace,
+                        "yes": yes,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                 } else {
-                    let msg = client::send_install_request(package)?;
-                    println!("{}", msg);
+                    let resp = client::send_command("install", serde_json::json!({
+                        "package": package,
+                        "yes": yes,
+                        "prefer_newest": prefer_newest,
+                        "stable_debian": stable_debian,
+                        "newest_redhat": newest_redhat,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                 }
                 Ok(())
             }
 
             SpmCommand::Repo { action } => match action {
                 RepoAction::Add { name, source, url, mirror, priority: _ } => {
-                    let msg = client::send_repo_request("add", name, Some(source), url.as_deref(), mirror)?;
-                    println!("{}", msg);
+                    let resp = client::send_command("repo", serde_json::json!({
+                        "package": serde_json::json!({
+                            "action": "add",
+                            "name": name,
+                            "source": source,
+                            "url": url,
+                            "mirrors": mirror,
+                        }).to_string(),
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::List => {
-                    repos::list_repos()?;
+                    let resp = client::send_command("repo-list", serde_json::json!({}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::Remove { name } => {
-                    let msg = client::send_repo_request("remove", name, None, None, &[])?;
-                    println!("{}", msg);
+                    let resp = client::send_command("repo", serde_json::json!({
+                        "package": serde_json::json!({
+                            "action": "remove",
+                            "name": name,
+                        }).to_string(),
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::Create { name, source, path, codename, component, mirror } => {
-                    let source_enum = match source.as_str() {
-                        "deb" => crate::types::RepoSource::Deb,
-                        "rpm" => crate::types::RepoSource::Rpm,
-                        "native" => crate::types::RepoSource::Native,
-                        _ => return Err(crate::error::SpmError::config(
-                            format!("Invalid repo source '{source}'. Use deb, rpm, or native")
-                        )),
-                    };
-                    repos::create_repo(name, source_enum, path.as_deref(), codename.as_deref(), component.as_deref(), mirror.as_deref())?;
-                    crate::output::result_message(format!("Created repository '{name}' ({source})"));
+                    let resp = client::send_command("repo-create", serde_json::json!({
+                        "name": name,
+                        "source": source,
+                        "path": path,
+                        "codename": codename,
+                        "component": component,
+                        "mirror": mirror,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::Publish { name, package } => {
-                    repos::publish_package(name, package)?;
+                    let resp = client::send_command("repo-publish", serde_json::json!({
+                        "name": name,
+                        "package": package,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::GenKey { name } => {
-                    repos::generate_signing_key(name)?;
+                    let resp = client::send_command("repo-gen-key", serde_json::json!({
+                        "package": name,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 RepoAction::Sign { name } => {
-                    repos::sign_repo(name)?;
+                    let resp = client::send_command("repo-sign", serde_json::json!({
+                        "package": name,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
             },
 
             SpmCommand::Analyze { mode, trace } => {
-                if let Some(path) = trace {
-                    crate::analyze::trace_binary(path)?;
-                } else {
-                    match mode {
-                        Some(AnalyzeMode::Orphan) => {
-                            crate::analyze::find_orphans()?;
-                        }
-                        Some(AnalyzeMode::Conflicts) => {
-                            crate::analyze::find_conflicts()?;
-                        }
-                        None => {
-                            crate::analyze::full_analysis()?;
-                        }
-                    }
-                }
+                let mode_str = match mode {
+                    Some(AnalyzeMode::Orphan) => "orphan",
+                    Some(AnalyzeMode::Conflicts) => "conflicts",
+                    None => "full",
+                };
+                let resp = client::send_command("analyze", serde_json::json!({
+                    "mode": mode_str,
+                    "trace": trace,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
 
             SpmCommand::Ps => {
-                process::find_deleted_libs()?;
+                let resp = client::send_command("ps", serde_json::json!({}))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
 
             SpmCommand::Sandbox { action } => match action {
                 SandboxAction::List => {
-                    sandbox::list_sandboxes()?;
+                    let resp = client::send_command("sandbox-list", serde_json::json!({}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 SandboxAction::Run { package, command } => {
-                    sandbox::run_in_sandbox(package, command)?;
+                    let resp = client::send_command("sandbox-run", serde_json::json!({
+                        "package": package,
+                        "commands": command,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
             },
 
             SpmCommand::Detect { install } => {
-                let gpus = crate::kernel::detect_gpu()?;
-                for gpu in &gpus {
-                    println!("  {} {} — {}", crate::output::bold("GPU"), gpu.pci_id, gpu.description);
-                    println!("    Vendor: {}", gpu.vendor);
-                    println!("    Driver: {}", gpu.driver);
-                    let suggestions = crate::kernel::suggest_gpu_packages(gpu);
-                    if !suggestions.is_empty() {
-                        println!("    Suggested packages:");
-                        for pkg in &suggestions {
-                            println!("      • {}", pkg);
-                        }
-                    }
-                    if *install && !suggestions.is_empty() {
-                        for pkg in &suggestions {
-                            crate::output::step_info(format!("Installing {}...", pkg));
-                            let _ = crate::package::install::install_package_smart(pkg, None, false, true, false, Default::default(), None);
-                        }
-                    }
-                }
-                if gpus.is_empty() {
-                    crate::output::step_info("No GPU detected via lspci");
-                }
+                let resp = client::send_command("detect", serde_json::json!({
+                    "install": install,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Build { path, output, sign } => {
-                let pkg_path = std::path::Path::new(path);
-                let output_path = crate::package::build::run_build(pkg_path, output.as_deref(), sign.as_deref())?;
-                crate::output::result_message(format!("Built {}", output_path));
+                let resp = client::send_command("build", serde_json::json!({
+                    "path": path,
+                    "output": output,
+                    "sign": sign,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
-            SpmCommand::Cleanup { force: _ } => {
-                let msg = client::send_cleanup_request()?;
-                println!("{}", msg);
+            SpmCommand::Cleanup { force } => {
+                let resp = client::send_command("cleanup", serde_json::json!({
+                    "force": force,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
 
             SpmCommand::Config { action } => match action {
                 ConfigAction::Show => {
-                    let cfg = SpmConfig::load()?;
-                    println!("{:#?}", cfg);
+                    let resp = client::send_command("config-show", serde_json::json!({}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 ConfigAction::Set { key, value } => {
-                    SpmConfig::set(key, value)?;
-                    crate::output::result_message(format!("Set {} = {}", key, value));
+                    let resp = client::send_command("config-set", serde_json::json!({
+                        "key": key,
+                        "value": value,
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
             },
 
-            SpmCommand::Remove { package, yes: _ } => {
-                let msg = client::send_remove_by_name_request(package)?;
-                println!("{}", msg);
+            SpmCommand::Remove { package, yes } => {
+                let resp = client::send_command("remove", serde_json::json!({
+                    "package": package,
+                    "yes": yes,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Purge { package } => {
-                let msg = client::send_purge_request(package)?;
-                println!("{}", msg);
+                let resp = client::send_command("purge", serde_json::json!({
+                    "package": package,
+                    "yes": true,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Autoremove { yes } => {
-                let msg = client::send_autoremove_request(*yes)?;
-                println!("{}", msg);
+                let resp = client::send_command("autoremove", serde_json::json!({
+                    "yes": yes,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Update => {
-                let msg = client::send_update_request()?;
-                println!("{}", msg);
+                let resp = client::send_command("update", serde_json::json!({}))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Index { action } => match action {
                 IndexAction::Rebuild => {
-                    crate::index::build_index()?;
-                    crate::output::result_message("SONAME index rebuilt successfully.");
+                    let resp = client::send_command("index-rebuild", serde_json::json!({}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
             }
-            SpmCommand::Upgrade { package, prefer_newest: _, stable_debian: _, newest_redhat: _ } => {
-                let msg = client::send_upgrade_request(package.clone())?;
-                println!("{}", msg);
+            SpmCommand::Upgrade { package, prefer_newest, stable_debian, newest_redhat } => {
+                let resp = client::send_command("upgrade", serde_json::json!({
+                    "package": package,
+                    "prefer_newest": prefer_newest,
+                    "stable_debian": stable_debian,
+                    "newest_redhat": newest_redhat,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::DistUpgrade { yes } => {
-                let msg = client::send_dist_upgrade_request(*yes)?;
-                println!("{}", msg);
+                let resp = client::send_command("dist-upgrade", serde_json::json!({
+                    "yes": yes,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Search { query } => {
-                let results = query::search_packages(query)?;
-                for pkg in &results {
-                    let source = pkg.source_repo.as_deref().unwrap_or("?");
-                    println!("  {} [{}/{}]", pkg.name, source, pkg.format);
-                }
-                println!("  {} package(s) found", results.len());
+                let resp = client::send_request_action("search", Some(query.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::GlobalSearch { query, yes } => {
                 global_search(query, *yes)
             }
             SpmCommand::SearchFile { path } => {
-                let owners = query::search_file_owner(path)?;
-                if owners.is_empty() {
-                    println!("  No package owns '{}'", path);
-                } else {
-                    for owner in &owners {
-                        println!("  {}", owner);
-                    }
-                }
+                let resp = client::send_request_action("search-file", Some(path.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Info { package } => {
-                let info = query::package_info(package)?;
-                let files = query::list_package_files(package)?;
-                let conn = crate::db::get_connection()?;
-                if let Some(pkg) = crate::db::get_installed_package(&conn, package)? {
-                    crate::output::show_installed_info(&pkg, files.len());
-                } else {
-                    println!("{}", info);
-                }
+                let resp = client::send_request_action("info", Some(package.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Files { package } => {
-                let files = query::list_package_files(package)?;
-                println!("  {} owns {} file(s):", package, files.len());
-                for f in &files {
-                    println!("    {}", f);
-                }
+                let resp = client::send_request_action("files", Some(package.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Depends { package } => {
-                let deps = query::package_dependencies(package)?;
-                println!("  {} depends on:", package);
-                for d in &deps {
-                    println!("    {}", d.name);
-                }
+                let resp = client::send_request_action("depends", Some(package.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Rdepends { package } => {
-                let rdeps = query::reverse_dependencies(package)?;
-                println!("  Packages depending on {}:", package);
-                for r in &rdeps {
-                    println!("    {}", r);
-                }
+                let resp = client::send_request_action("rdepends", Some(package.clone()))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::History { undo } => {
-                if let Some(id) = undo {
-                    query::undo_transaction(*id)?;
-                } else {
-                    let history = query::show_history()?;
-                    println!("{}", history);
-                }
+                let resp = client::send_command("history", serde_json::json!({
+                    "id": undo.map(|id| id.to_string()),
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Snapshot { action } => match action {
                 SnapshotAction::Create => {
-                    query::create_snapshot()?;
+                    let resp = client::send_command("snapshot", serde_json::json!({
+                        "package": serde_json::json!({"action": "create"}).to_string(),
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
                 SnapshotAction::Rollback { id } => {
-                    query::rollback_snapshot(id)?;
+                    let resp = client::send_command("snapshot", serde_json::json!({
+                        "package": serde_json::json!({"action": "rollback", "id": id}).to_string(),
+                    }))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
                     Ok(())
                 }
             }
             SpmCommand::Group { action } => match action {
-                GroupAction::Create => crate::cli::group::handle_group_create(),
-                GroupAction::Add { user } => crate::cli::group::handle_group_add_user(user),
-                GroupAction::Remove { user } => crate::cli::group::handle_group_remove_user(user),
-                GroupAction::List => crate::cli::group::handle_group_list(),
+                GroupAction::Create => {
+                    let resp = client::send_command("group", serde_json::json!({"action": "create"}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
+                    Ok(())
+                }
+                GroupAction::Add { user } => {
+                    let resp = client::send_command("group", serde_json::json!({"action": "add", "user": user}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
+                    Ok(())
+                }
+                GroupAction::Remove { user } => {
+                    let resp = client::send_command("group", serde_json::json!({"action": "remove", "user": user}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
+                    Ok(())
+                }
+                GroupAction::List => {
+                    let resp = client::send_command("group", serde_json::json!({"action": "list"}))?;
+                    println!("{}", resp["message"].as_str().unwrap_or(""));
+                    Ok(())
+                }
             },
             SpmCommand::Sync { files, prune } => {
-                crate::sync::sync_system(*files, *prune)?;
+                let resp = client::send_command("sync", serde_json::json!({
+                    "files": files,
+                    "prune": prune,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Fsck { fix, files } => {
-                crate::fsck::check_integrity(*fix, *files)?;
+                let resp = client::send_command("fsck", serde_json::json!({
+                    "fix": fix,
+                    "files": files,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
                 Ok(())
             }
             SpmCommand::Init { root, from_system, fix_backend, install_daemon } => {
-                let fb = *fix_backend || root.is_some() || *from_system;
-                crate::bootstrap::init_system(root.as_deref(), *from_system, fb)?;
-                if *install_daemon {
-                    crate::bootstrap::install_daemon_service()?;
+                let resp = client::send_command("init", serde_json::json!({
+                    "root": root,
+                    "from_system": from_system,
+                    "fix_backend": fix_backend,
+                    "install_daemon": install_daemon,
+                }))?;
+                println!("{}", resp["message"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            SpmCommand::SelfUpdate { check, version } => {
+                let resp = client::send_command("self-update", serde_json::json!({
+                    "check": check,
+                    "version": version,
+                }))?;
+                let msg = resp["message"].as_str().unwrap_or("");
+                println!("{}", msg);
+                if let Some(data) = resp.get("data") {
+                    if let Some(url) = data.get("download_url").and_then(|v| v.as_str()) {
+                        eprintln!("  Download: {}", url);
+                    }
                 }
                 Ok(())
             }

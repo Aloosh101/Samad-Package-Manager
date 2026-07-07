@@ -1,6 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 
 use crate::error::{SpmError, SpmResult};
 use serde::Serialize;
@@ -9,7 +8,10 @@ use serde::Serialize;
 struct ClientRequest {
     action: String,
     package: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<serde_json::Value>,
     user_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     user_home: Option<String>,
 }
 
@@ -21,91 +23,36 @@ fn current_home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
-fn send_action_request(action: &str, package: Option<String>) -> SpmResult<String> {
+pub fn send_request_action(action: &str, package: Option<String>) -> SpmResult<serde_json::Value> {
     let req = ClientRequest {
         action: action.to_string(),
         package,
+        params: None,
         user_id: current_uid(),
         user_home: Some(current_home()),
     };
-    send_request(&req)
+    send_request_raw(&req)
 }
 
-pub fn send_install_request(package: &str) -> SpmResult<String> {
-    send_action_request("install", Some(package.to_string()))
-}
-
-pub fn send_remove_by_name_request(package: &str) -> SpmResult<String> {
-    send_action_request("remove", Some(package.to_string()))
-}
-
-pub fn send_list_request() -> SpmResult<String> {
-    send_action_request("list", None)
-}
-
-pub fn send_update_request() -> SpmResult<String> {
-    send_action_request("update", None)
-}
-
-pub fn send_upgrade_request(package: Option<String>) -> SpmResult<String> {
-    send_action_request("upgrade", package)
-}
-
-pub fn send_purge_request(package: &str) -> SpmResult<String> {
-    send_action_request("purge", Some(package.to_string()))
-}
-
-pub fn send_autoremove_request(yes: bool) -> SpmResult<String> {
-    send_action_request("autoremove", Some(yes.to_string()))
-}
-
-pub fn send_cleanup_request() -> SpmResult<String> {
-    send_action_request("cleanup", None)
-}
-
-pub fn send_repo_request(action: &str, name: &str, source: Option<&str>, url: Option<&str>, mirrors: &[String]) -> SpmResult<String> {
-    let detail = serde_json::json!({
-        "action": action,
-        "name": name,
-        "source": source,
-        "url": url,
-        "mirrors": mirrors,
-    });
+pub fn send_command(action: &str, params: serde_json::Value) -> SpmResult<serde_json::Value> {
+    let package = params.get("package").and_then(|v| v.as_str()).map(String::from);
     let req = ClientRequest {
-        action: "repo".to_string(),
-        package: Some(detail.to_string()),
+        action: action.to_string(),
+        package,
+        params: Some(params),
         user_id: current_uid(),
         user_home: Some(current_home()),
     };
-    send_request(&req)
+    send_request_raw(&req)
 }
 
-pub fn send_snapshot_request(action: &str, id: Option<&str>) -> SpmResult<String> {
-    let req = ClientRequest {
-        action: "snapshot".to_string(),
-        package: Some(serde_json::json!({
-            "action": action,
-            "id": id,
-        }).to_string()),
-        user_id: current_uid(),
-        user_home: Some(current_home()),
-    };
-    send_request(&req)
-}
-
-pub fn send_dist_upgrade_request(yes: bool) -> SpmResult<String> {
-    send_action_request("dist-upgrade", Some(yes.to_string()))
-}
-
-fn send_request(req: &ClientRequest) -> SpmResult<String> {
+fn send_request_raw(req: &ClientRequest) -> SpmResult<serde_json::Value> {
     let socket_path = crate::daemon::socket_path();
 
-    let mut stream = match try_connect(&socket_path) {
-        Ok(s) => s,
-        Err(e) => return Err(SpmError::other(format!(
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|e| SpmError::other(format!(
             "Cannot connect to spmd at {socket_path}: {e}. Is spmd running?"
-        ))),
-    };
+        )))?;
 
     let json = serde_json::to_string(req)
         .map_err(|e| SpmError::other(format!("Serialization error: {e}")))?;
@@ -140,31 +87,13 @@ fn send_request(req: &ClientRequest) -> SpmResult<String> {
                 if status == "error" {
                     return Err(SpmError::other(format!("Daemon error: {message}")));
                 }
-                return Ok(message.to_string());
+                return Ok(val);
             }
         }
 
         // Fallback: print unrecognized lines
         eprintln!("{}", response.trim());
     }
-}
-
-fn try_connect(socket_path: &str) -> Result<UnixStream, std::io::Error> {
-    match UnixStream::connect(socket_path) {
-        Ok(s) => return Ok(s),
-        Err(_) => {}
-    }
-    // Daemon not running — try to auto-start it via pidfile check
-    if !Path::new("/run/spmd.pid").exists() {
-        if let Ok(child) = std::process::Command::new("/usr/local/bin/spmd").spawn() {
-            drop(child); // detach
-        }
-    }
-    for _ in 0..20 {
-        if let Ok(s) = UnixStream::connect(socket_path) { return Ok(s); }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    UnixStream::connect(socket_path)
 }
 
 #[cfg(test)]
@@ -176,6 +105,7 @@ mod tests {
         let req = ClientRequest {
             action: "install".to_string(),
             package: Some("nginx".to_string()),
+            params: None,
             user_id: 1000,
             user_home: Some("/home/user".to_string()),
         };
@@ -191,6 +121,7 @@ mod tests {
         let req = ClientRequest {
             action: "list".to_string(),
             package: None,
+            params: None,
             user_id: 0,
             user_home: None,
         };
@@ -211,6 +142,7 @@ mod tests {
         let req = ClientRequest {
             action: "repo".to_string(),
             package: Some(detail.to_string()),
+            params: None,
             user_id: 0,
             user_home: Some("/root".to_string()),
         };
@@ -221,21 +153,16 @@ mod tests {
     }
 
     #[test]
-    fn test_client_request_snapshot_serialization() {
-        let detail = serde_json::json!({
-            "action": "create",
-            "id": null,
-        });
+    fn test_client_request_with_params() {
         let req = ClientRequest {
-            action: "snapshot".to_string(),
-            package: Some(detail.to_string()),
-            user_id: 0,
-            user_home: Some("/root".to_string()),
+            action: "build".to_string(),
+            package: None,
+            params: Some(serde_json::json!({"path": "/tmp/pkg", "output": "/tmp/out"})),
+            user_id: 1000,
+            user_home: Some("/home/user".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"snapshot\""), "missing snapshot action: {json}");
-        // "create" is inside a nested JSON string (escaped quotes), so check without surrounding quotes
-        assert!(json.contains("create"), "missing create in nested json: {json}");
-        assert!(json.contains("null"), "missing null id: {json}");
+        assert!(json.contains("\"build\""));
+        assert!(json.contains("\"/tmp/out\""));
     }
 }

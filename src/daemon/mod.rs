@@ -11,6 +11,7 @@ use tokio::net::UnixListener;
 
 use crate::db;
 use crate::error::{SpmError, SpmResult};
+use crate::types::SpmConfig;
 
 pub mod conflict;
 pub mod ipc;
@@ -35,6 +36,7 @@ const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 struct DaemonRequest {
     action: String,
     package: Option<String>,
+    params: Option<serde_json::Value>,
     user_id: u32,
 }
 
@@ -42,13 +44,27 @@ struct DaemonRequest {
 struct DaemonResponse {
     status: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
 }
+
+type HandlerResult = Result<(String, Option<serde_json::Value>), SpmError>;
 
 impl DaemonResponse {
     fn ok(msg: &str) -> String {
         serde_json::to_string(&DaemonResponse {
             status: "ok".to_string(),
             message: msg.to_string(),
+            data: None,
+        })
+        .unwrap_or_else(|_| r#"{"status":"error","message":"serialization failed"}"#.to_string())
+    }
+
+    fn ok_with_data(msg: &str, data: serde_json::Value) -> String {
+        serde_json::to_string(&DaemonResponse {
+            status: "ok".to_string(),
+            message: msg.to_string(),
+            data: Some(data),
         })
         .unwrap_or_else(|_| r#"{"status":"error","message":"serialization failed"}"#.to_string())
     }
@@ -57,6 +73,7 @@ impl DaemonResponse {
         serde_json::to_string(&DaemonResponse {
             status: "error".to_string(),
             message: msg.to_string(),
+            data: None,
         })
         .unwrap_or_else(|_| r#"{"status":"error","message":"serialization failed"}"#.to_string())
     }
@@ -225,73 +242,227 @@ impl RateLimiter {
         let response = match action.as_str() {
             "install" => {
                 if authorized {
-                    handle_system_install(&req, uid).await
+                    handle_system_install(&req, uid).await.map(|m| (m, None))
                 } else {
-                    handle_user_install(&req, uid).await
+                    handle_user_install(&req, uid).await.map(|m| (m, None))
                 }
             }
             "remove" => {
                 if authorized {
-                    handle_system_remove(&req, uid).await
+                    handle_system_remove(&req, uid).await.map(|m| (m, None))
                 } else {
-                    handle_user_remove(&req, uid).await
+                    handle_user_remove(&req, uid).await.map(|m| (m, None))
                 }
             }
-            "list" => handle_list(&req, uid, authorized).await,
+            "list" => {
+                let json = handle_list(&req, uid, authorized).await?;
+                let names: Vec<String> = serde_json::from_str(&json)
+                    .unwrap_or_else(|_| vec![json.clone()]);
+                Ok((format!("{} package(s) installed", names.len()), Some(serde_json::json!(names))))
+            }
             "upgrade" => {
                 if authorized {
-                    handle_upgrade(&req, uid).await
+                    handle_upgrade(&req, uid).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can upgrade system packages"))
                 }
             }
             "update" => {
                 if authorized {
-                    handle_update().await
+                    handle_update().await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can update repositories"))
                 }
             }
             "dist-upgrade" => {
                 if authorized {
-                    handle_dist_upgrade(&req).await
+                    handle_dist_upgrade(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can run dist-upgrade"))
                 }
             }
             "purge" => {
                 if authorized {
-                    handle_purge(&req).await
+                    handle_purge(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can purge packages"))
                 }
             }
             "autoremove" => {
                 if authorized {
-                    handle_autoremove(&req).await
+                    handle_autoremove(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can autoremove packages"))
                 }
             }
             "cleanup" => {
                 if authorized {
-                    handle_cleanup().await
+                    handle_cleanup(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can run cleanup"))
                 }
             }
             "repo" => {
                 if authorized {
-                    handle_repo(&req).await
+                    handle_repo(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can manage repositories"))
                 }
             }
             "snapshot" => {
                 if authorized {
-                    handle_snapshot(&req).await
+                    handle_snapshot(&req).await.map(|m| (m, None))
                 } else {
                     Err(SpmError::permission_denied("Only root or 'spm' group can manage snapshots"))
+                }
+            }
+            "convert" => {
+                if authorized {
+                    handle_convert(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can convert packages"))
+                }
+            }
+            "install-local" => {
+                if authorized {
+                    handle_install_local(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can install local packages"))
+                }
+            }
+            "install-sandbox" => {
+                if authorized {
+                    handle_install_sandbox(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can install sandboxes"))
+                }
+            }
+            "build" => {
+                if authorized {
+                    handle_build(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can build packages"))
+                }
+            }
+            "search" => handle_search(&req).await,
+            "search-file" => handle_search_file(&req).await,
+            "info" => handle_info(&req).await,
+            "files" => handle_files(&req).await,
+            "depends" => handle_depends(&req).await,
+            "rdepends" => handle_rdepends(&req).await,
+            "config-show" => {
+                if authorized {
+                    handle_config_show().await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can view config"))
+                }
+            }
+            "config-set" => {
+                if authorized {
+                    handle_config_set(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can set config"))
+                }
+            }
+            "index-rebuild" => {
+                if authorized {
+                    handle_index_rebuild().await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can rebuild index"))
+                }
+            }
+            "history" => handle_history(&req).await,
+            "init" => {
+                if authorized {
+                    handle_init(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can initialize system"))
+                }
+            }
+            "group" => {
+                if authorized {
+                    handle_group(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can manage groups"))
+                }
+            }
+            "fsck" => {
+                if authorized {
+                    handle_fsck(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can run fsck"))
+                }
+            }
+            "sync" => {
+                if authorized {
+                    handle_sync(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can sync system"))
+                }
+            }
+            "repo-list" => {
+                if authorized {
+                    handle_repo_list().await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can list repos"))
+                }
+            }
+            "repo-create" => {
+                if authorized {
+                    handle_repo_create(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can create repos"))
+                }
+            }
+            "repo-publish" => {
+                if authorized {
+                    handle_repo_publish(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can publish packages"))
+                }
+            }
+            "repo-gen-key" => {
+                if authorized {
+                    handle_repo_gen_key(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can generate keys"))
+                }
+            }
+            "repo-sign" => {
+                if authorized {
+                    handle_repo_sign(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can sign repos"))
+                }
+            }
+            "sandbox-list" => handle_sandbox_list().await,
+            "sandbox-run" => {
+                if authorized {
+                    handle_sandbox_run(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can run sandboxes"))
+                }
+            }
+            "detect" => handle_detect(&req).await,
+            "analyze" => {
+                if authorized {
+                    handle_analyze(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can analyze system"))
+                }
+            }
+            "ps" => {
+                if authorized {
+                    handle_ps().await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can check processes"))
+                }
+            }
+            "self-update" => {
+                if authorized {
+                    handle_self_update(&req).await
+                } else {
+                    Err(SpmError::permission_denied("Only root or 'spm' group can self-update"))
                 }
             }
             other => Err(SpmError::other(format!("Unknown action: {other}"))),
@@ -303,13 +474,17 @@ impl RateLimiter {
         crate::output::clear_current_uid();
         let _ = relay.join();
 
-        let (status, detail) = match response {
-            Ok(msg) => ("ok", msg),
-            Err(e) => ("error", e.to_string()),
+        let (status, detail, data) = match response {
+            Ok((msg, data)) => ("ok", msg, data),
+            Err(e) => ("error", e.to_string(), None),
         };
 
         let resp = if status == "ok" {
-            DaemonResponse::ok(&detail)
+            if let Some(d) = data {
+                DaemonResponse::ok_with_data(&detail, d)
+            } else {
+                DaemonResponse::ok(&detail)
+            }
         } else {
             DaemonResponse::error(&detail)
         };
@@ -333,14 +508,31 @@ async fn handle_system_install(
         SpmError::other("Missing 'package' field".to_string())
     })?;
 
+    let params = req.params.as_ref();
+    let strategy = resolve_strategy(req);
+    let yes = params.and_then(|p| p["yes"].as_bool()).unwrap_or(true);
     let name = package.to_string();
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
-        crate::package::install::install_package(&name, None, false, true, false, Default::default())
+        crate::package::install::install_package(&name, None, false, yes, false, strategy)
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Install failed: {e}")))?;
 
     Ok(format!("Installed {package} (system)"))
+}
+
+fn resolve_strategy(req: &DaemonRequest) -> crate::types::VersionStrategy {
+    let params = req.params.as_ref();
+    let prefer_newest = params.and_then(|p| p["prefer_newest"].as_bool()).unwrap_or(false);
+    let stable_debian = params.and_then(|p| p["stable_debian"].as_bool()).unwrap_or(false);
+    let newest_redhat = params.and_then(|p| p["newest_redhat"].as_bool()).unwrap_or(false);
+    if stable_debian {
+        crate::types::VersionStrategy::PreferStable
+    } else if newest_redhat || prefer_newest {
+        crate::types::VersionStrategy::PreferNewest
+    } else {
+        crate::types::VersionStrategy::PreferStable
+    }
 }
 
 async fn handle_system_remove(
@@ -433,8 +625,9 @@ async fn handle_upgrade(
 ) -> Result<String, SpmError> {
     let package = req.package.clone();
     let is_specific = package.is_some();
+    let strategy = resolve_strategy(req);
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
-        crate::package::install::upgrade_package(package.as_deref(), Default::default(), None)
+        crate::package::install::upgrade_package(package.as_deref(), strategy, None)
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Upgrade failed: {e}")))?;
@@ -539,7 +732,7 @@ async fn handle_update() -> Result<String, SpmError> {
 }
 
 async fn handle_dist_upgrade(req: &DaemonRequest) -> Result<String, SpmError> {
-    let yes = req.package.as_deref().and_then(|v| v.parse::<bool>().ok()).unwrap_or(false);
+    let yes = req.params.as_ref().and_then(|p| p["yes"].as_bool()).unwrap_or(false);
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
         crate::package::install::dist_upgrade_packages(yes)
     }).await
@@ -562,7 +755,7 @@ async fn handle_purge(req: &DaemonRequest) -> Result<String, SpmError> {
 }
 
 async fn handle_autoremove(req: &DaemonRequest) -> Result<String, SpmError> {
-    let yes = req.package.as_deref().and_then(|v| v.parse::<bool>().ok()).unwrap_or(false);
+    let yes = req.params.as_ref().and_then(|p| p["yes"].as_bool()).unwrap_or(false);
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
         crate::package::install::autoremove_packages(yes)
     }).await
@@ -571,9 +764,10 @@ async fn handle_autoremove(req: &DaemonRequest) -> Result<String, SpmError> {
     Ok("Autoremove completed".to_string())
 }
 
-async fn handle_cleanup() -> Result<String, SpmError> {
+async fn handle_cleanup(req: &DaemonRequest) -> Result<String, SpmError> {
+    let force = req.params.as_ref().and_then(|p| p["force"].as_bool()).unwrap_or(true);
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
-        crate::package::cleanup::cleanup_all(true)
+        crate::package::cleanup::cleanup_all(force)
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Cleanup failed: {e}")))?;
@@ -663,6 +857,675 @@ async fn handle_snapshot(req: &DaemonRequest) -> Result<String, SpmError> {
         }
         _ => Err(SpmError::other(format!("Unknown snapshot action: {action}"))),
     }
+}
+
+async fn handle_install_local(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let path = params["path"].as_str().ok_or_else(|| SpmError::other("Missing 'path'"))?;
+    let replace = params["replace"].as_bool().unwrap_or(false);
+    let yes = params["yes"].as_bool().unwrap_or(true);
+    let p = path.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::package::install::install_local_package(&p, replace, yes)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Install failed: {e}")))?;
+    Ok((format!("Installed {path}"), None))
+}
+
+async fn handle_convert(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let path = params["path"].as_str().ok_or_else(|| SpmError::other("Missing 'path'"))?;
+    let p = path.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::package::sam::convert_to_sam(&p)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Convert failed: {e}")))?;
+    Ok((format!("Converted {} to .sam format", path), None))
+}
+
+async fn handle_install_sandbox(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let package = params["package"].as_str().ok_or_else(|| SpmError::other("Missing 'package'"))?;
+    let level = params["level"].as_str().unwrap_or("standard");
+    let replace = params["replace"].as_bool().unwrap_or(false);
+    let yes = params["yes"].as_bool().unwrap_or(true);
+    let smart = params["smart"].as_bool().unwrap_or(false);
+    let strategy = resolve_strategy(req);
+    let pkg = package.to_string();
+    let lvl = level.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::package::install::install_package(&pkg, Some(&lvl), replace, yes, smart, strategy)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Sandbox install failed: {e}")))?;
+    Ok((format!("Installed '{package}' in sandbox ({level})"), None))
+}
+
+async fn handle_build(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let path = params["path"].as_str().ok_or_else(|| SpmError::other("Missing 'path'"))?;
+    let output = params["output"].as_str();
+    let sign = params["sign"].as_str();
+    let p = path.to_string();
+    let out = output.map(|s| s.to_string());
+    let sg = sign.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || -> SpmResult<String> {
+        crate::package::build::run_build(std::path::Path::new(&p), out.as_deref(), sg.as_deref())
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Build failed: {e}")))?;
+    Ok((format!("Built {path}"), None))
+}
+
+async fn handle_search(req: &DaemonRequest) -> HandlerResult {
+    let query = req.package.as_deref().unwrap_or("");
+    let query = query.to_string();
+    let results = tokio::task::spawn_blocking(move || -> SpmResult<Vec<crate::types::Package>> {
+        crate::package::query::search_packages(&query)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Search failed: {e}")))?;
+    let mut out = String::new();
+    for pkg in &results {
+        let source = pkg.source_repo.as_deref().unwrap_or("?");
+        let fmt = format!("{:?}", pkg.format);
+        out.push_str(&format!("  {} [{}/{}]\n", pkg.name, source, fmt));
+    }
+    out.push_str(&format!("  {} package(s) found", results.len()));
+    Ok((out, None))
+}
+
+async fn handle_search_file(req: &DaemonRequest) -> HandlerResult {
+    let path = req.package.as_deref().ok_or_else(|| SpmError::other("Missing path"))?;
+    let path = path.to_string();
+    let owners = tokio::task::spawn_blocking(move || -> SpmResult<Vec<String>> {
+        crate::package::query::search_file_owner(&path)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Search failed: {e}")))?;
+    Ok((format!("{} owner(s) found", owners.len()), Some(serde_json::json!(owners))))
+}
+
+async fn handle_info(req: &DaemonRequest) -> HandlerResult {
+    let package = req.package.as_deref().ok_or_else(|| SpmError::other("Missing package"))?;
+    let package = package.to_string();
+    let info = tokio::task::spawn_blocking(move || -> SpmResult<String> {
+        let info = crate::package::query::package_info(&package)?;
+        let files = crate::package::query::list_package_files(&package)?;
+        let conn = db::get_connection()?;
+        if let Some(pkg) = db::get_installed_package(&conn, &package)? {
+            let mut out = String::new();
+            out.push_str(&format!("  Package: {} v{}\n", pkg.name, pkg.version));
+            out.push_str(&format!("  Format: {:?}\n", pkg.format));
+            out.push_str(&format!("  Type: {:?}\n", pkg.install_type));
+            out.push_str(&format!("  Source: {}\n", pkg.source_repo.as_deref().unwrap_or("none")));
+            out.push_str(&format!("  Files: {}", files.len()));
+            Ok(out)
+        } else {
+            Ok(info)
+        }
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Info failed: {e}")))?;
+    Ok((info, None))
+}
+
+async fn handle_files(req: &DaemonRequest) -> HandlerResult {
+    let pkg_name = req.package.as_deref().ok_or_else(|| SpmError::other("Missing package"))?;
+    let pkg = pkg_name.to_string();
+    let files = tokio::task::spawn_blocking(move || -> SpmResult<Vec<String>> {
+        crate::package::query::list_package_files(&pkg)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("List files failed: {e}")))?;
+    let mut out = format!("  {} owns {} file(s):\n", pkg_name, files.len());
+    for f in &files {
+        out.push_str(&format!("    {}\n", f));
+    }
+    Ok((out, None))
+}
+
+async fn handle_depends(req: &DaemonRequest) -> HandlerResult {
+    let pkg_name = req.package.as_deref().ok_or_else(|| SpmError::other("Missing package"))?;
+    let pkg = pkg_name.to_string();
+    let deps = tokio::task::spawn_blocking(move || -> SpmResult<Vec<crate::types::Dependency>> {
+        crate::package::query::package_dependencies(&pkg)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Deps failed: {e}")))?;
+    let mut out = format!("  {} depends on:\n", pkg_name);
+    for d in &deps {
+        out.push_str(&format!("    {}\n", d.name));
+    }
+    Ok((out, None))
+}
+
+async fn handle_rdepends(req: &DaemonRequest) -> HandlerResult {
+    let pkg_name = req.package.as_deref().ok_or_else(|| SpmError::other("Missing package"))?;
+    let pkg = pkg_name.to_string();
+    let rdeps = tokio::task::spawn_blocking(move || -> SpmResult<Vec<String>> {
+        crate::package::query::reverse_dependencies(&pkg)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Reverse deps failed: {e}")))?;
+    let mut out = format!("  Packages depending on {}:\n", pkg_name);
+    for r in &rdeps {
+        out.push_str(&format!("    {}\n", r));
+    }
+    Ok((out, None))
+}
+
+async fn handle_config_show() -> HandlerResult {
+    let cfg = tokio::task::spawn_blocking(move || -> SpmResult<SpmConfig> {
+        SpmConfig::load()
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Config load failed: {e}")))?;
+    let json = serde_json::to_value(&cfg)
+        .map_err(|e| SpmError::other(format!("Serialization failed: {e}")))?;
+    Ok(("Config loaded".to_string(), Some(json)))
+}
+
+async fn handle_config_set(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let k = params["key"].as_str().ok_or_else(|| SpmError::other("Missing 'key'"))?;
+    let v = params["value"].as_str().ok_or_else(|| SpmError::other("Missing 'value'"))?;
+    let key = k.to_string();
+    let value = v.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        SpmConfig::set(&key, &value)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Config set failed: {e}")))?;
+    Ok((format!("Set config {k} = {v}"), None))
+}
+
+async fn handle_index_rebuild() -> HandlerResult {
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::index::build_index()
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Index rebuild failed: {e}")))?;
+    Ok(("SONAME index rebuilt".to_string(), None))
+}
+
+async fn handle_history(req: &DaemonRequest) -> HandlerResult {
+    let undo = req.params.as_ref().and_then(|p| p["id"].as_str()).map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || -> SpmResult<String> {
+        if let Some(id) = undo {
+            let id_i64: i64 = id.parse().map_err(|e| SpmError::other(format!("Invalid transaction ID: {e}")))?;
+            crate::package::query::undo_transaction(id_i64)?;
+            Ok(format!("Transaction {id} undone"))
+        } else {
+            crate::package::query::show_history()
+        }
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("History failed: {e}")))
+        .map(|msg| (msg, None))
+}
+
+async fn handle_init(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref();
+    let root_opt = params.and_then(|p| p["root"].as_str()).map(|s| s.to_string());
+    let from_system = params.and_then(|p| p["from_system"].as_bool()).unwrap_or(false);
+    let fix_backend = params.and_then(|p| p["fix_backend"].as_bool()).unwrap_or(false);
+    let install_daemon = params.and_then(|p| p["install_daemon"].as_bool()).unwrap_or(false);
+    let fb = fix_backend || root_opt.is_some() || from_system;
+    let root_c = root_opt.clone();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::bootstrap::init_system(root_c.as_deref(), from_system, fb)?;
+        if install_daemon {
+            crate::bootstrap::install_daemon_service()?;
+        }
+        Ok(())
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Init failed: {e}")))?;
+    Ok(("System initialized".to_string(), None))
+}
+
+async fn handle_group(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let action = params["action"].as_str().ok_or_else(|| SpmError::other("Missing 'action'"))?;
+    match action {
+        "create" => {
+            let _ = tokio::task::spawn_blocking(crate::cli::group::handle_group_create).await;
+            Ok(("spm group created".to_string(), None))
+        }
+        "add" => {
+            let u = params["user"].as_str().ok_or_else(|| SpmError::other("Missing 'user'"))?;
+            let user = u.to_string();
+            let _ = tokio::task::spawn_blocking(move || crate::cli::group::handle_group_add_user(&user)).await;
+            Ok((format!("User {u} added to spm group"), None))
+        }
+        "remove" => {
+            let u = params["user"].as_str().ok_or_else(|| SpmError::other("Missing 'user'"))?;
+            let user = u.to_string();
+            let _ = tokio::task::spawn_blocking(move || crate::cli::group::handle_group_remove_user(&user)).await;
+            Ok((format!("User {u} removed from spm group"), None))
+        }
+        "list" => {
+            let _ = tokio::task::spawn_blocking(crate::cli::group::handle_group_list).await;
+            Ok(("Group members listed".to_string(), None))
+        }
+        _ => Err(SpmError::other(format!("Unknown group action: {action}"))),
+    }
+}
+
+async fn handle_fsck(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref();
+    let fix = params.and_then(|p| p["fix"].as_bool()).unwrap_or(false);
+    let files = params.and_then(|p| p["files"].as_bool()).unwrap_or(false);
+    let _ = tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::fsck::check_integrity(fix, files)
+    }).await;
+    Ok(("Integrity check completed".to_string(), None))
+}
+
+async fn handle_sync(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref();
+    let files = params.and_then(|p| p["files"].as_bool()).unwrap_or(false);
+    let prune = params.and_then(|p| p["prune"].as_bool()).unwrap_or(false);
+    let _ = tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::sync::sync_system(files, prune)
+    }).await;
+    Ok(("System sync completed".to_string(), None))
+}
+
+async fn handle_repo_list() -> HandlerResult {
+    let repos = tokio::task::spawn_blocking(move || -> SpmResult<Vec<(String, crate::types::RepoConfig)>> {
+        crate::config::repos::load_repos()
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Repo list failed: {e}")))?;
+    if repos.is_empty() {
+        return Ok(("No repositories configured.\nAdd one: spm repo add <name> --source native --url <url>".to_string(), None));
+    }
+    let mut out = String::new();
+    for (name, config) in &repos {
+        let url = config.url.as_deref().unwrap_or("-");
+        out.push_str(&format!("  {} ({}) — {}\n", name, config.source, url));
+    }
+    Ok((out, None))
+}
+
+async fn handle_repo_create(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let n = params["name"].as_str().ok_or_else(|| SpmError::other("Missing 'name'"))?;
+    let source = params["source"].as_str().ok_or_else(|| SpmError::other("Missing 'source'"))?;
+    let path = params["path"].as_str();
+    let codename = params["codename"].as_str();
+    let component = params["component"].as_str();
+    let mirror = params["mirror"].as_str();
+    let source_enum = match source {
+        "deb" => crate::types::RepoSource::Deb,
+        "rpm" => crate::types::RepoSource::Rpm,
+        "native" => crate::types::RepoSource::Native,
+        _ => return Err(SpmError::config(format!("Invalid source '{source}'"))),
+    };
+    let name = n.to_string();
+    let path = path.map(|s| s.to_string());
+    let codename = codename.map(|s| s.to_string());
+    let component = component.map(|s| s.to_string());
+    let mirror = mirror.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::config::repos::create_repo(&name, source_enum, path.as_deref(), codename.as_deref(), component.as_deref(), mirror.as_deref())
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Repo create failed: {e}")))?;
+    Ok((format!("Created repository '{n}'"), None))
+}
+
+async fn handle_repo_publish(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let n = params["name"].as_str().ok_or_else(|| SpmError::other("Missing 'name'"))?;
+    let p = params["package"].as_str().ok_or_else(|| SpmError::other("Missing 'package'"))?;
+    let name = n.to_string();
+    let package = p.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::config::repos::publish_package(&name, &package)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Publish failed: {e}")))?;
+    Ok((format!("Published {p} to '{n}'"), None))
+}
+
+async fn handle_repo_gen_key(req: &DaemonRequest) -> HandlerResult {
+    let n = req.package.as_deref().ok_or_else(|| SpmError::other("Missing repo name"))?;
+    let name = n.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::config::repos::generate_signing_key(&name)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Gen key failed: {e}")))?;
+    Ok((format!("Generated signing key for '{n}'"), None))
+}
+
+async fn handle_repo_sign(req: &DaemonRequest) -> HandlerResult {
+    let n = req.package.as_deref().ok_or_else(|| SpmError::other("Missing repo name"))?;
+    let name = n.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::config::repos::sign_repo(&name)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Sign failed: {e}")))?;
+    Ok((format!("Signed repository '{n}'"), None))
+}
+
+async fn handle_sandbox_list() -> HandlerResult {
+    let sandbox_dir = crate::config::paths::sandboxes_dir();
+    let entries = tokio::task::spawn_blocking(move || -> SpmResult<Vec<String>> {
+        if !sandbox_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&sandbox_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                names.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        Ok(names)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Sandbox list failed: {e}")))?;
+    if entries.is_empty() {
+        return Ok(("No sandboxes found".to_string(), None));
+    }
+    let mut out = String::new();
+    for name in &entries {
+        out.push_str(&format!("  {} (symlink)\n", name));
+    }
+    out.push_str(&format!("\nTotal: {} sandbox(es)", entries.len()));
+    Ok((out, None))
+}
+
+async fn handle_sandbox_run(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref().ok_or_else(|| SpmError::other("Missing params"))?;
+    let pkg_name = params["package"].as_str().ok_or_else(|| SpmError::other("Missing 'package'"))?;
+    let commands: Vec<String> = params["commands"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let pkg = pkg_name.to_string();
+    tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::sandbox::run_in_sandbox(&pkg, &commands)
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("Sandbox run failed: {e}")))?;
+    Ok((format!("Ran sandbox '{pkg_name}'"), None))
+}
+
+async fn handle_detect(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref();
+    let install = params.and_then(|p| p["install"].as_bool()).unwrap_or(false);
+    let gpus = tokio::task::spawn_blocking(move || -> SpmResult<Vec<crate::kernel::GpuDevice>> {
+        crate::kernel::detect_gpu()
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+        .map_err(|e| SpmError::other(format!("GPU detection failed: {e}")))?;
+    let mut out = String::new();
+    for gpu in &gpus {
+        out.push_str(&format!("  GPU {} — {}\n", gpu.pci_id, gpu.description));
+        out.push_str(&format!("    Vendor: {}\n", gpu.vendor));
+        out.push_str(&format!("    Driver: {}\n", gpu.driver));
+        let suggestions = crate::kernel::suggest_gpu_packages(gpu);
+        if !suggestions.is_empty() {
+            out.push_str("    Suggested packages:\n");
+            for pkg in &suggestions {
+                out.push_str(&format!("      • {}\n", pkg));
+                if install {
+                    let _ = crate::package::install::install_package_smart(pkg, None, false, true, false, Default::default(), None);
+                }
+            }
+        }
+    }
+    if gpus.is_empty() {
+        out.push_str("  No GPU detected via lspci");
+    }
+    Ok((out, None))
+}
+
+async fn handle_analyze(req: &DaemonRequest) -> HandlerResult {
+    let params = req.params.as_ref();
+    let mode = params.and_then(|p| p["mode"].as_str()).unwrap_or("full").to_string();
+    let trace = params.and_then(|p| p["trace"].as_str()).map(|s| s.to_string());
+    match trace {
+        Some(path) => {
+            let p = path.clone();
+            tokio::task::spawn_blocking(move || -> SpmResult<()> {
+                crate::analyze::trace_binary(&p)
+            }).await
+                .map_err(|e| SpmError::other(format!("Join error: {e}")))?
+                .map_err(|e| SpmError::other(format!("Trace failed: {e}")))?;
+            Ok((format!("Trace completed for {}", path), None))
+        }
+        None => {
+            let mode_c = mode.clone();
+            let _ = tokio::task::spawn_blocking(move || -> SpmResult<()> {
+                match mode_c.as_str() {
+                    "orphan" => crate::analyze::find_orphans(),
+                    "conflicts" => crate::analyze::find_conflicts(),
+                    _ => crate::analyze::full_analysis(),
+                }
+            }).await;
+            Ok((format!("{} analysis completed", mode), None))
+        }
+    }
+}
+
+async fn handle_ps() -> HandlerResult {
+    let _ = tokio::task::spawn_blocking(crate::util::process::find_deleted_libs).await;
+    Ok(("Process check completed".to_string(), None))
+}
+
+async fn handle_self_update(req: &DaemonRequest) -> HandlerResult {
+    use std::process::Command;
+
+    let params = req.params.as_ref();
+    let check_only = params.and_then(|p| p["check"].as_bool()).unwrap_or(false);
+    let specific_version = params.and_then(|p| p["version"].as_str()).and_then(|s| {
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    });
+
+    let current = env!("CARGO_PKG_VERSION");
+
+    crate::output::step_info(format!("Current version: v{current}"));
+
+    // ── Detect architecture ──
+    let arch = tokio::task::spawn_blocking(|| -> SpmResult<String> {
+        let output = Command::new("uname")
+            .arg("-m")
+            .output()
+            .map_err(|e| SpmError::other(format!("Cannot detect arch: {e}")))?;
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let arch = match raw.as_str() {
+            "x86_64" => "x86_64-linux-gnu",
+            "i686" | "i386" => "i686-linux-gnu",
+            "aarch64" => "aarch64-linux-gnu",
+            "armv7l" | "armv7" => "armv7-linux-gnueabihf",
+            "riscv64" => "riscv64-linux-gnu",
+            other => return Err(SpmError::other(format!("Unsupported architecture: {other}"))),
+        };
+        Ok(arch.to_string())
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))??;
+
+    // ── Fetch release info from GitHub ──
+    let (tag_name, release_json) = tokio::task::spawn_blocking(move || -> SpmResult<(String, serde_json::Value)> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(concat!("spm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| SpmError::other(format!("HTTP client error: {e}")))?;
+
+        let url = match specific_version {
+            Some(ref v) => format!("https://api.github.com/repos/anomalyco/Samad-Package-Manager/releases/tags/v{v}"),
+            None => "https://api.github.com/repos/anomalyco/Samad-Package-Manager/releases/latest".to_string(),
+        };
+
+        let resp = client.get(&url)
+            .send()
+            .map_err(|e| SpmError::other(format!("GitHub API error: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(SpmError::other(format!(
+                "GitHub API returned {} for {url}",
+                resp.status()
+            )));
+        }
+
+        let json: serde_json::Value = resp.json()
+            .map_err(|e| SpmError::other(format!("Invalid JSON: {e}")))?;
+
+        let tag = json["tag_name"].as_str()
+            .ok_or_else(|| SpmError::other("Missing 'tag_name' in release response"))?
+            .to_string();
+
+        Ok((tag, json))
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))??;
+
+    let tag_ver = tag_name.trim_start_matches('v');
+
+    // ── Compare versions ──
+    if !is_newer(tag_ver, current) {
+        let msg = format!("Already up to date (v{current})");
+        return Ok((msg, None));
+    }
+
+    if check_only {
+        let msg = format!("Update available: v{current} → {tag_name}");
+        return Ok((msg, Some(serde_json::json!({
+            "current_version": current,
+            "latest_version": tag_ver,
+        }))));
+    }
+
+    // ── Find matching assets ──
+    let assets = release_json["assets"].as_array()
+        .ok_or_else(|| SpmError::other("No assets in release"))?;
+
+    let spm_asset_name = format!("spm-{arch}");
+    let spmd_asset_name = format!("spmd-{arch}");
+
+    let spm_url = assets.iter()
+        .find(|a| a["name"].as_str() == Some(&spm_asset_name))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .ok_or_else(|| SpmError::other(format!("No spm binary for {arch} in this release")))?
+        .to_string();
+
+    let spmd_url = assets.iter()
+        .find(|a| a["name"].as_str() == Some(&spmd_asset_name))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .ok_or_else(|| SpmError::other(format!("No spmd binary for {arch} in this release")))?
+        .to_string();
+
+    let checksums_url = assets.iter()
+        .find(|a| a["name"].as_str() == Some("checksums.txt"))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .ok_or_else(|| SpmError::other("No checksums.txt in release"))?
+        .to_string();
+
+    crate::output::step_info("Downloading spm binary...");
+
+    let (spm_data, spmd_data, checksums_data) = tokio::task::spawn_blocking(move || -> SpmResult<(Vec<u8>, Vec<u8>, String)> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent(concat!("spm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| SpmError::other(format!("HTTP client error: {e}")))?;
+
+        let spm_data = client.get(&spm_url)
+            .send()
+            .map_err(|e| SpmError::other(format!("Failed to download spm: {e}")))?
+            .bytes()
+            .map_err(|e| SpmError::other(format!("Failed to read spm: {e}")))?
+            .to_vec();
+
+        let spmd_data = client.get(&spmd_url)
+            .send()
+            .map_err(|e| SpmError::other(format!("Failed to download spmd: {e}")))?
+            .bytes()
+            .map_err(|e| SpmError::other(format!("Failed to read spmd: {e}")))?
+            .to_vec();
+
+        let checksums_data = client.get(&checksums_url)
+            .send()
+            .map_err(|e| SpmError::other(format!("Failed to download checksums: {e}")))?
+            .text()
+            .map_err(|e| SpmError::other(format!("Failed to read checksums: {e}")))?;
+
+        Ok((spm_data, spmd_data, checksums_data))
+    }).await
+        .map_err(|e| SpmError::other(format!("Join error: {e}")))??;
+
+    // ── Verify checksums ──
+    crate::output::step_info("Verifying checksums...");
+    verify_checksum(&spm_data, &spm_asset_name, &checksums_data)?;
+    verify_checksum(&spmd_data, &spmd_asset_name, &checksums_data)?;
+
+    // ── Replace binaries ──
+    crate::output::step_info("Installing update...");
+
+    let spm_path = "/usr/bin/spm";
+    let spmd_path = "/usr/bin/spmd";
+
+    // Write to temp files then atomically rename
+    std::fs::write("/tmp/spm-update", &spm_data)
+        .map_err(|e| SpmError::other(format!("Cannot write temp spm: {e}")))?;
+    std::fs::write("/tmp/spmd-update", &spmd_data)
+        .map_err(|e| SpmError::other(format!("Cannot write temp spmd: {e}")))?;
+
+    // Set executable permissions
+    std::fs::set_permissions("/tmp/spm-update", std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| SpmError::other(format!("Cannot chmod temp spm: {e}")))?;
+    std::fs::set_permissions("/tmp/spmd-update", std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| SpmError::other(format!("Cannot chmod temp spmd: {e}")))?;
+
+    // Rename into place (atomic on same filesystem)
+    std::fs::rename("/tmp/spm-update", spm_path)
+        .map_err(|e| SpmError::other(format!("Cannot replace {spm_path}: {e}")))?;
+    std::fs::rename("/tmp/spmd-update", spmd_path)
+        .map_err(|e| SpmError::other(format!("Cannot replace {spmd_path}: {e}")))?;
+
+    let msg = format!("Updated to {tag_name}\n  {spm_path}\n  {spmd_path}\nRestart spmd to apply: systemctl restart spmd");
+
+    Ok((msg, None))
+}
+
+fn is_newer(tag_ver: &str, current: &str) -> bool {
+    fn parse_ver(v: &str) -> (u64, u64, u64) {
+        let parts: Vec<&str> = v.trim_start_matches('v').splitn(3, '.').collect();
+        let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (major, minor, patch)
+    }
+    let (m1, n1, p1) = parse_ver(tag_ver);
+    let (m2, n2, p2) = parse_ver(current);
+    (m1, n1, p1) > (m2, n2, p2)
+}
+
+fn verify_checksum(data: &[u8], filename: &str, checksums: &str) -> SpmResult<()> {
+    use sha2::{Digest, Sha256};
+    let expected_hash = checksums.lines()
+        .find(|line| line.ends_with(filename))
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or_else(|| SpmError::other(format!("No checksum for {filename}")))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let actual_hash = format!("{:x}", hasher.finalize());
+
+    if actual_hash != expected_hash {
+        return Err(SpmError::other(format!(
+            "Checksum mismatch for {filename}: expected {expected_hash}, got {actual_hash}"
+        )));
+    }
+    Ok(())
 }
 
 async fn auto_update_loop() {
