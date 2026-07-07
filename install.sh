@@ -39,7 +39,7 @@ block() {
 }
 
 step() {
-  printf "\n${MAGENTA}┃ Step ${1}/5 ┃${NC} ${BOLD}${2}${NC}\n" >&2
+  printf "\n${MAGENTA}┃ Step ${1}/6 ┃${NC} ${BOLD}${2}${NC}\n" >&2
   printf "${MAGENTA}┃${NC}\n" >&2
 }
 
@@ -56,7 +56,7 @@ for arg in "$@"; do
   esac
 done
 
-trap 'rm -f /tmp/spm-* /tmp/spmd-* /tmp/checksums.txt 2>/dev/null; printf "\n" >&2' EXIT
+trap 'kill "${SPMD_PID:-}" 2>/dev/null; rm -f /tmp/spm-* /tmp/spmd-* /tmp/checksums.txt 2>/dev/null; printf "\n" >&2' EXIT
 
 # ── Detect architecture ──
 detect_arch() {
@@ -261,25 +261,71 @@ if [ -z "$USER_MODE" ] && [ ! -L /usr/bin/spm ]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# Step 5 — Finalise
+# Step 5 — Daemon
 # ═══════════════════════════════════════════════════════════════════
-step 5 "Finalise"
+step 5 "Daemon"
+
+# Start spmd temporarily for init and repo setup
+SPMD_PID=""
+start_spmd() {
+  if [ -S /run/spm.sock ] && spm ps &>/dev/null; then
+    detail "spmd already running"
+    return
+  fi
+  detail "Starting spmd temporarily..."
+  spmd &>/dev/null &
+  SPMD_PID=$!
+  # Wait up to 5 seconds for socket
+  for i in $(seq 1 50); do
+    if [ -S /run/spm.sock ]; then
+      detail "spmd ready (pid ${SPMD_PID})"
+      return
+    fi
+    sleep 0.1
+  done
+  warn "spmd did not start in time — init and repo setup will be skipped"
+}
+
+stop_spmd() {
+  if [ -n "$SPMD_PID" ]; then
+    kill "$SPMD_PID" 2>/dev/null || true
+    wait "$SPMD_PID" 2>/dev/null || true
+    rm -f /run/spm.sock 2>/dev/null || true
+  fi
+}
+
+start_spmd
 
 VER="v${VERSION#v}"
 if command -v spm &>/dev/null; then
   VER=$(spm --version 2>/dev/null || echo "$VER")
 fi
 
-if ${SUDO} spm init &>/dev/null; then
-  ok "spm init"
+# ═══════════════════════════════════════════════════════════════════
+# Step 6 — Initialise
+# ═══════════════════════════════════════════════════════════════════
+step 6 "Initialise"
+
+if [ -n "$SPMD_PID" ] || [ -S /run/spm.sock ]; then
+  if ${SUDO} spm init &>/dev/null; then
+    ok "spm init"
+  else
+    warn "spm init failed — run manually"
+  fi
 else
-  detail "run ${BOLD}spm init${NC} manually"
+  detail "spmd not available — run ${BOLD}spm init${NC} manually"
 fi
 
 # ── Repository setup ──
 setup_repos() {
   printf "\n${BLUE}┌─ Repository setup${NC}\n" >&2
   printf "${BLUE}│${NC}\n" >&2
+
+  if [ -z "$SPMD_PID" ] && [ ! -S /run/spm.sock ]; then
+    printf "${BLUE}│${NC}  ${DIM}(spmd not running — skipping repo setup)${NC}\n" >&2
+    printf "${BLUE}└─${NC}\n" >&2
+    return
+  fi
 
   # 1. Standard open-source repos (Ubuntu + Fedora always)
   printf "${BLUE}│${NC}  Adding ${BOLD}Ubuntu${NC} (deb) repository...\n" >&2
@@ -338,6 +384,38 @@ setup_repos() {
 }
 
 setup_repos
+
+# ── Decide: keep daemon or install service ──
+printf "\n${BLUE}┌─ Daemon setup${NC}\n" >&2
+printf "${BLUE}│${NC}\n" >&2
+printf "${BLUE}│${NC}  ${BOLD}Install spmd as a systemd service?${NC}\n" >&2
+printf "${BLUE}│${NC}  ${DIM}(required for all spm commands)${NC}\n" >&2
+printf "${BLUE}│${NC}  ${DIM}[Y/n]${NC} " >&2
+read -r service </dev/tty || service="y"
+case "${service:-y}" in
+  n|N|no|NO)
+    printf "${BLUE}│${NC}\n" >&2
+    detail "spmd temp process will be killed"
+    detail "start spmd manually: ${BOLD}sudo spmd &${NC}"
+    stop_spmd
+    ;;
+  *)
+    if command -v systemctl &>/dev/null; then
+      ${SUDO} spm init --install-daemon >/dev/null 2>&1 \
+        && ok "spmd systemd service installed" \
+        || warn "systemd install failed — start spmd manually"
+      ${SUDO} systemctl enable --now spmd >/dev/null 2>&1 \
+        && ok "spmd service started and enabled" \
+        || detail "start manually: ${BOLD}sudo systemctl start spmd${NC}"
+      # Temp spmd no longer needed
+      stop_spmd
+    else
+      detail "systemd not found — keeping spmd in background"
+      detail "start spmd on boot: ${BOLD}sudo spmd &${NC}"
+    fi
+    ;;
+esac
+printf "${BLUE}└─${NC}\n" >&2
 
 # ── Summary ──
 printf "\n${GREEN}"
