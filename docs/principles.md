@@ -10,6 +10,14 @@ SPM extracts `.deb`, `.rpm`, and `.sam` archives using pure Rust parsers. No `dp
 
 *"A package manager that depends on the very tools it manages has surrendered its independence."*
 
+## 1b. Thin Client Architecture
+
+SPM follows a strict thin-client model: the `spm` CLI never executes package operations directly. Every command — install, remove, update, search, build, config — is serialised as JSON and sent over a Unix socket to the `spmd` daemon. The daemon authenticates the request via `SO_PEERCRED` (kernel-provided UID/GID, no tokens or passwords), rate-limits, executes the operation, and returns a structured response.
+
+If `spmd` is unreachable, `spm` fails immediately. There is no fallback to direct execution. This enforces a clean separation of privilege: the CLI runs as an ordinary user, while the daemon runs as root, and all IPC is kernel-authenticated.
+
+*"The CLI is a remote control. The daemon is the hand."*
+
 ## 2. Atomic Transactions
 
 Every install, remove, or upgrade is an atomic transaction. If any step fails — download, extraction, script execution, database commit — the entire operation rolls back. The system is never left in an inconsistent state.

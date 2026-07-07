@@ -62,12 +62,15 @@ sudo cargo test --test integration
 
 ## Architecture Notes
 
-- CLI flags are defined in `src/cli/args.rs` via `clap`
-- Package extraction is in `src/package/extract/`
-- Repo configuration is in `src/config/repos.rs`
-- Database schema is in `src/db/schema.rs`
+- **Thin client**: all CLI commands send JSON over a Unix socket to `spmd`. No command executes package operations directly. See `src/cli/client.rs`.
+- **Command definitions**: clap derive structs in `src/cli/args.rs` (~800 lines, 30+ subcommands).
+- **Daemon handlers**: all operations are handled in `src/daemon/mod.rs` (~1740 lines, 28+ handlers).
+- **Package extraction**: pure Rust parsers in `src/package/extract/` (ar, cpio, deb822, RPM header).
+- **Repo management**: `src/config/repos.rs` (~1070 lines) handles CRUD, update, create, sign, publish.
+- **Database schema**: SQLite via `src/db/mod.rs` with read/write lock separation.
+- **New handlers**: add the action string to the match block in `daemon/mod.rs`, then implement the handler function. Add the CLI variant to `args.rs` and dispatch via `client::send_command()`.
 
 ## Versioning
 
 SPM follows [Semantic Versioning](https://semver.org/). The current version is
-reflected in `Cargo.toml` and tagged in git for releases.
+reflected in `Cargo.toml` (`env!("CARGO_PKG_VERSION")`) and tagged in git for releases.

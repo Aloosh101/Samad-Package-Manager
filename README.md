@@ -1,7 +1,7 @@
 # SPM — Samad Package Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/rustc-2021+-orange" alt="Rust Edition">
   <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-green" alt="License">
   <img src="https://img.shields.io/badge/status-beta-green" alt="Status">
@@ -54,12 +54,23 @@ This auto-detects your architecture and installs the pre-built binary. No Rust t
 | SO_PEERCRED daemon authentication | ✅ |
 | Transaction-based atomic install with rollback | ✅ |
 | File conflict detection + resolution | ✅ |
-| Foreign package manager detection (dpkg/rpm/pacman) | ✅ |
+| No dependency on system package managers (dpkg/rpm/apt/dnf) | ✅ |
 | Cross-distro install (`.deb` on Fedora, `.rpm` on Debian) | ✅ |
+| Thin-client daemon architecture (`spm` → socket → `spmd`) | ✅ |
+| Self-update (`spm self-update`) | ✅ |
 | Offline LAN distribution via daemon socket | ✅ |
 | Btrfs snapshot integration | ✅ |
 | Shell completions (bash/zsh/fish) | ✅ |
 | Systemd socket activation | ✅ |
+| Sandbox list / run (`spm sandbox`) | ✅ |
+| Hardware detection (`spm detect`) | ✅ |
+| Package build (`spm build`) | ✅ |
+| Package conversion (`spm install --convert-only`) | ✅ |
+| `.sam` native format packaging | ✅ |
+| Repository signing (Ed25519) | ✅ |
+| Integrity check (`spm fsck`) | ✅ |
+| System sync (`spm sync`) | ✅ |
+| Process deleted-libs check (`spm ps`) | ✅ |
 
 ---
 
@@ -89,6 +100,7 @@ git clone https://github.com/Aloosh101/Samad-Package-Manager && cd spm
 cargo build --release
 sudo cp target/release/spm /usr/local/bin/spm
 sudo cp target/release/spmd /usr/local/bin/spmd
+sudo spmd                           # Start the daemon (required for all operations)
 ```
 
 ### Requirements
@@ -96,40 +108,39 @@ sudo cp target/release/spmd /usr/local/bin/spmd
 - Rust 1.75+ (MSRV)
 - Linux kernel 5.10+ (for full sandbox features)
 - SQLite 3.x (bundled, no system dep)
-- Optional: systemd (for socket activation)
+- systemd (optional, for socket activation / daemon service)
 
 ---
 
-## Architecture
+## Architecture (Thin Client Model)
 
 ```
-                       spm (CLI)
-                          │
-               ┌──────────┴──────────┐
-               │                     │
-               ▼                     ▼
-           Unix Socket          Direct Execution
-         /run/spm.sock         (fallback path)
-               │
-          ┌────┴────┐
-          │  spmd   │  Tokio async daemon
-          └────┬────┘
-               │
-          ┌────┴────┐
-          │ Auth    │  SO_PEERCRED · rate-limit · concurrency
-          └────┬────┘
-               │
-     ┌─────────┴─────────────┐
-     │                       │
-     ▼                       ▼
- System Install          User Install
-(root / spm group)      (~/.local)
-     │                       │
-     ▼                       ▼
-/var/lib/spm/          ~/.local/share/spm/
-  ├─ store/{deb,rpm,sam}/  ├─ store/
-  ├─ metadata.db            ├─ history.sqlite
-  └─ cache/                 └─ bin/
+                     spm (CLI)
+                    thin client
+                        │
+                        ▼
+                  Unix Socket            ← if spmd is down, spm fails
+                /run/spm.sock
+                        │
+                   ┌────┴────┐
+                   │  spmd   │  Tokio async daemon (root)
+                   └────┬────┘
+                        │
+                  ┌─────┴─────┐
+                  │ Auth      │  SO_PEERCRED · rate-limit · concurrency
+                  └─────┬─────┘
+                        │
+               ┌────────┴────────┐
+               │                 │
+               ▼                 ▼
+         System Install      User Install
+        (root / spm group)   (~/.local)
+               │                 │
+               ▼                 ▼
+         /var/lib/spm/      ~/.local/share/spm/
+           ├─ store/          ├─ store/
+           ├─ metadata.db     ├─ history.sqlite
+           └─ cache/          └─ bin/
 ```
 
 See [docs/architecture.md](docs/architecture.md) for a full breakdown.
@@ -139,20 +150,22 @@ See [docs/architecture.md](docs/architecture.md) for a full breakdown.
 ## Build & Test
 
 ```bash
-cargo check          # No codegen
-cargo build          # Debug build
+cargo check                # No codegen
+cargo build                # Debug build
 cargo build --release
-cargo test --lib     # Run all lib tests
-cargo clippy --no-deps
+cargo test --lib           # Unit tests (482+)
+cargo test --lib -- --nocapture  # With stdout
+cargo clippy --no-deps     # No warnings
 ```
 
 ---
 
 ## Project Status
 
-SPM is in **beta** (v0.3.1). The core feature set is complete: package operations
-install, remove, update, search, info, files, and history work end-to-end with
-Debian repositories across multiple architectures.
+SPM is in **beta** (v0.3.4). The core feature set is complete: all 27+ package
+operations (install, remove, update, upgrade, search, info, files, history,
+sandbox, repo management, analysis, self-update, and more) work through the
+spmd daemon across 5 architectures (x86_64, aarch64, armv7, i686, riscv64).
 
 ---
 
