@@ -108,7 +108,7 @@ fn clean_msg(msg: &str) -> String {
     msg.replace('\n', " ").replace('\r', "")
 }
 
-fn send_msg(msg: impl std::fmt::Display) {
+pub fn send_msg(msg: impl std::fmt::Display) {
     let s = clean_msg(&msg.to_string());
     if let Some(uid) = current_uid() {
         send_progress(uid, s);
@@ -132,6 +132,7 @@ pub fn step_info(msg: impl std::fmt::Display) {
 
 pub fn step_warn(msg: impl std::fmt::Display) {
     eprintln!("  {} {}", yellow("⚠"), msg);
+    send_msg(format!("warn: {msg}"));
 }
 
 pub fn step_error(msg: impl std::fmt::Display) {

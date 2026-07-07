@@ -77,7 +77,20 @@ fn send_request_raw(req: &ClientRequest) -> SpmResult<serde_json::Value> {
             if let Some(typ) = val.get("type").and_then(|v| v.as_str()) {
                 if typ == "progress" {
                     if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
-                        eprintln!("  {}", msg);
+                        if msg.starts_with("✔ ") || msg.starts_with("ℹ ") || msg.starts_with("⚠ ") || msg.starts_with("✖ ") {
+                            eprintln!("  {}", msg);
+                        } else if msg.starts_with("📥") {
+                            eprint!("\r  {}", msg);
+                            let _ = std::io::stderr().flush();
+                        } else if msg.starts_with("success: ") {
+                            eprintln!("  ✔ {}", &msg[9..]);
+                        } else if msg.starts_with("info: ") {
+                            eprintln!("  ℹ {}", &msg[6..]);
+                        } else if msg.starts_with("warn: ") {
+                            eprintln!("  ⚠ {}", &msg[6..]);
+                        } else {
+                            eprintln!("  {}", msg);
+                        }
                     }
                     continue;
                 }

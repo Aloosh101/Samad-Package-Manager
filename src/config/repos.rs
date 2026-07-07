@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -165,7 +166,6 @@ fn create_deb_repo(
     // Release file
     let release_path = base_path.join("dists").join(codename).join("Release");
     if !release_path.exists() {
-        use std::io::Write;
         let release_content = format!(
             "Codename: {codename}\nComponents: {component}\nArchitectures: {arch}\n"
         );
@@ -444,7 +444,6 @@ fn publish_to_rpm(
     let primary_path = repodata_dir.join("primary.xml.gz");
     let mut primary_content = String::new();
     if primary_path.exists() {
-        use std::io::Read;
         let compressed = std::fs::read(&primary_path)
             .map_err(|e| SpmError::config(format!("Cannot read primary.xml.gz: {e}")))?;
         let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
@@ -504,7 +503,6 @@ fn publish_to_rpm(
     let filelists_path = repodata_dir.join("filelists.xml.gz");
     let mut filelists_content = String::new();
     if filelists_path.exists() {
-        use std::io::Read;
         let compressed = std::fs::read(&filelists_path)
             .map_err(|e| SpmError::config(format!("Cannot read filelists.xml.gz: {e}")))?;
         let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
@@ -666,10 +664,9 @@ fn update_from_deb(name: &str, config: &RepoConfig) -> SpmResult<()> {
                 let cache_name = format!("Packages-{codename}-{component}-{arch}");
                 let cache_path = cache.join(&cache_name);
 
-                match fetch_with_retry(&packages_url, 2) {
+                match fetch_bytes_progress(&packages_url, 2, &format!("{name}/{codename}/{component}")) {
                     Ok(compressed) => {
                         // Decompress gz
-                        use std::io::Read;
                         let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
                         let mut text = Vec::new();
                         if decoder.read_to_end(&mut text).is_ok()
@@ -694,14 +691,55 @@ fn update_from_deb(name: &str, config: &RepoConfig) -> SpmResult<()> {
     Ok(())
 }
 
-fn update_from_rpm(name: &str, _config: &RepoConfig) -> SpmResult<()> {
+fn repo_base_urls(config: &RepoConfig) -> Vec<String> {
+    let arch = "x86_64";
+    let mut urls = Vec::new();
+
+    // If an explicit URL is set (highest priority)
+    if let Some(url) = &config.url {
+        urls.push(url.trim_end_matches('/').to_string());
+        return urls;
+    }
+
+    // Otherwise construct from mirrors + release + repos
+    let mirrors = match &config.mirrors {
+        Some(m) if !m.is_empty() => m,
+        _ => return urls,
+    };
+    let release = config.release.as_deref().unwrap_or("rawhide");
+    let repos: Vec<&str> = match config.repos.as_deref() {
+        Some(r) => r.iter().map(|s| s.as_str()).collect(),
+        None => vec!["fedora"],
+    };
+
+    for mirror in mirrors {
+        let base = mirror.trim_end_matches('/');
+        for repo in &repos {
+            match *repo {
+                "fedora" | "releases" | "Everything" =>
+                    urls.push(format!("{base}/releases/{release}/Everything/{arch}/os")),
+                "updates" =>
+                    urls.push(format!("{base}/updates/{release}/Everything/{arch}")),
+                "updates-testing" | "testing" =>
+                    urls.push(format!("{base}/updates/testing/{release}/Everything/{arch}")),
+                "fedora-modular" | "modular" =>
+                    urls.push(format!("{base}/modular/{release}/Everything/{arch}/os")),
+                _ =>
+                    urls.push(format!("{base}/{repo}/{release}/Everything/{arch}")),
+            }
+        }
+    }
+    urls
+}
+
+fn update_from_rpm(name: &str, config: &RepoConfig) -> SpmResult<()> {
     let cache = paths::repos_cache_dir().join("rpm").join(name);
-    let repos_d = PathBuf::from("/etc/yum.repos.d");
 
     fs::create_dir_all(&cache)
         .map_err(|e| SpmError::config(format!("Cannot create rpm cache: {e}")))?;
 
-    let mut found = false;
+    // Try copying system yum repos first (backward compat on RedHat/Fedora)
+    let repos_d = PathBuf::from("/etc/yum.repos.d");
     if repos_d.exists() {
         if let Ok(dir) = fs::read_dir(&repos_d) {
             for entry in dir.flatten() {
@@ -711,7 +749,6 @@ fn update_from_rpm(name: &str, _config: &RepoConfig) -> SpmResult<()> {
                         if let Ok(content) = fs::read_to_string(&path) {
                             let fname = path.file_name().unwrap_or_default();
                             fs::write(cache.join(fname), &content).ok();
-                            found = true;
                         }
                     }
                 }
@@ -719,10 +756,330 @@ fn update_from_rpm(name: &str, _config: &RepoConfig) -> SpmResult<()> {
         }
     }
 
-    if !found {
-        tracing::warn!("No rpm/yum repos found on this system");
+    // Download repomd.xml + primary.xml.gz from each repo base URL
+    let base_urls = repo_base_urls(config);
+    if base_urls.is_empty() {
+        return Ok(());
     }
+
+    let mut all_packages: Vec<crate::types::RepoIndexRecord> = Vec::new();
+    let arch = "x86_64";
+
+    for base_url in &base_urls {
+        let repomd_url = format!("{base_url}/repodata/repomd.xml");
+        let repomd_data = match fetch_with_retry(&repomd_url, 2) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("RPM '{name}': cannot fetch {repomd_url}: {e}");
+                continue;
+            }
+        };
+
+        let primary_path = match parse_repomd_primary(&repomd_data) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("RPM '{name}': no primary.xml in repomd from {repomd_url}");
+                continue;
+            }
+        };
+
+        let primary_url = if primary_path.starts_with("http://") || primary_path.starts_with("https://") {
+            primary_path
+        } else {
+            let hp = primary_path.trim_start_matches('/');
+            format!("{base_url}/{hp}")
+        };
+
+        let mut primary_xml = Vec::new();
+        match fetch_bytes_progress(&primary_url, 2, &format!("{name} primary")) {
+            Ok(data) => {
+                if primary_url.ends_with(".zst") {
+                    match zstd::decode_all(&data[..]) {
+                        Ok(d) => primary_xml = d,
+                        Err(e) => {
+                            tracing::warn!("RPM '{name}': failed to decompress primary.xml.zst: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+                    if decoder.read_to_end(&mut primary_xml).is_err() {
+                        tracing::warn!("RPM '{name}': failed to decompress primary.xml.gz");
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("RPM '{name}': cannot fetch {primary_url}: {e}");
+                continue;
+            }
+        }
+
+        match parse_rpm_primary_xml(&primary_xml, name, arch) {
+            Ok(mut pkgs) => {
+                let count = pkgs.len();
+                all_packages.append(&mut pkgs);
+                crate::output::step_success(format!("RPM '{name}': {count} packages from {base_url}"));
+            }
+            Err(e) => {
+                tracing::warn!("RPM '{name}': failed to parse primary.xml: {e}");
+            }
+        }
+    }
+
+    if all_packages.is_empty() {
+        tracing::warn!("RPM '{name}': no packages downloaded from any mirror");
+    } else {
+        let index = crate::types::RepoIndex {
+            repo_name: name.to_string(),
+            format_version: 1,
+            packages: all_packages,
+        };
+        let json = serde_json::to_string_pretty(&index)
+            .map_err(|e| SpmError::other(format!("Cannot serialize repo index: {e}")))?;
+        fs::write(cache.join("repo-index.json"), &json)
+            .map_err(|e| SpmError::config(format!("Cannot write repo index: {e}")))?;
+        crate::output::step_success(format!("Cached index for '{name}'"));
+    }
+
     Ok(())
+}
+
+/// Find the href of the primary.xml.gz in a repomd.xml document.
+fn parse_repomd_primary(data: &[u8]) -> Option<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut wanted_type = String::new();
+    let mut href = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
+                let name = e.name();
+                let tag = name.as_ref();
+                if tag == b"data" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == b"type" {
+                            wanted_type = String::from_utf8_lossy(&a.value).to_string();
+                        }
+                    }
+                } else if tag == b"location" && (wanted_type == "primary" || wanted_type == "primary_db") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == b"href" {
+                            href = Some(String::from_utf8_lossy(&a.value).to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let end_name = e.name();
+                if end_name.as_ref() == b"data" {
+                    if href.is_some() {
+                        return href;
+                    }
+                    wanted_type.clear();
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                tracing::warn!("repomd.xml parse error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse RPM primary.xml and return a list of RepoIndexRecord.
+fn parse_rpm_primary_xml(data: &[u8], _repo_name: &str, _arch: &str) -> SpmResult<Vec<crate::types::RepoIndexRecord>> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    #[derive(Default)]
+    struct Pkg {
+        name: String,
+        arch: String,
+        version: String,
+        summary: String,
+        description: String,
+        filename: String,
+        hash: String,
+        size: u64,
+        deps: Vec<String>,
+        provides: Vec<String>,
+    }
+
+    let mut pkg = Pkg::default();
+    let mut in_pkg = false;
+    let mut in_format = false;
+    let mut in_requires = false;
+    let mut in_provides = false;
+    // Text tracking
+    let mut text_tag = String::new();
+
+    let mut packages: Vec<crate::types::RepoIndexRecord> = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
+                let name_b = e.name();
+                let tag_b = name_b.as_ref();
+                // Normalize namespace-prefixed tags
+                let tag = if tag_b.starts_with(b"rpm:") { &tag_b[4..] } else { tag_b };
+
+                match tag {
+                    b"package" => {
+                        pkg = Pkg::default();
+                        in_pkg = true;
+                    }
+                    b"format" if in_pkg => in_format = true,
+                    b"requires" if in_format => in_requires = true,
+                    b"provides" if in_format => in_provides = true,
+                    b"entry" => {
+                        let mut name_attr = String::new();
+                        let mut flags = String::new();
+                        for a in e.attributes().flatten() {
+                            match a.key.as_ref() {
+                                b"name" => name_attr = String::from_utf8_lossy(&a.value).to_string(),
+                                b"flags" => flags = String::from_utf8_lossy(&a.value).to_string(),
+                                _ => {}
+                            }
+                        }
+                        if in_requires && !name_attr.is_empty() {
+                            pkg.deps.push(name_attr.clone());
+                        }
+                        if in_provides && !name_attr.is_empty()
+                            && flags != "EQ" && name_attr.contains(".so")
+                        {
+                            pkg.provides.push(name_attr);
+                        }
+                    }
+                    b"version" => {
+                        for a in e.attributes().flatten() {
+                            match a.key.as_ref() {
+                                b"ver" => pkg.version = String::from_utf8_lossy(&a.value).to_string(),
+                                b"rel" => {
+                                    let rel = String::from_utf8_lossy(&a.value);
+                                    if !pkg.version.is_empty() {
+                                        pkg.version.push('-');
+                                        pkg.version.push_str(&rel);
+                                    }
+                                }
+                                b"epoch" => {
+                                    let epoch = String::from_utf8_lossy(&a.value);
+                                    if epoch != "0" && !pkg.version.is_empty() {
+                                        pkg.version = format!("{epoch}:{}", pkg.version);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"location" => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"href" {
+                                pkg.filename = String::from_utf8_lossy(&a.value).to_string();
+                            }
+                        }
+                    }
+                    b"size" => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"package" {
+                                pkg.size = String::from_utf8_lossy(&a.value).parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    b"checksum" => {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == b"type" {
+                                // Only store sha256 checksums
+                                let ctype = String::from_utf8_lossy(&a.value);
+                                if ctype == "sha256" {
+                                    // Text will follow
+                                    text_tag = "checksum".to_string();
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Track text-containing elements for text events
+                        if in_pkg && !in_format {
+                            match tag {
+                                b"name" | b"arch" | b"summary" | b"description" => {
+                                    text_tag = String::from_utf8_lossy(tag).to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(ref e)) => {
+                if !in_pkg || text_tag.is_empty() {
+                    continue;
+                }
+                let txt = String::from_utf8_lossy(e.as_ref()).trim().to_string();
+                if txt.is_empty() { continue; }
+                match text_tag.as_str() {
+                    "name" => pkg.name = txt,
+                    "arch" => pkg.arch = txt,
+                    "summary" => pkg.summary = txt,
+                    "description" => pkg.description = txt,
+                    "checksum" => pkg.hash = txt,
+                    _ => {}
+                }
+                text_tag.clear();
+            }
+            Ok(Event::End(ref e)) => {
+                let end_name = e.name();
+                let tag_b = end_name.as_ref();
+                let tag = if tag_b.starts_with(b"rpm:") { &tag_b[4..] } else { tag_b };
+
+                match tag {
+                    b"package" => {
+                        if in_pkg && !pkg.name.is_empty() {
+                            let desc = if pkg.summary.is_empty() { pkg.description.clone() } else { pkg.summary.clone() };
+                            packages.push(crate::types::RepoIndexRecord {
+                                name: pkg.name.clone(),
+                                version: pkg.version.clone(),
+                                architecture: pkg.arch.clone(),
+                                description: desc,
+                                dependencies: pkg.deps.clone(),
+                                provides_soname: pkg.provides.clone(),
+                                conflicts: Vec::new(),
+                                filename: pkg.filename.clone(),
+                                hash: pkg.hash.clone(),
+                                size: pkg.size,
+                            });
+                        }
+                        in_pkg = false;
+                        in_format = false;
+                        in_requires = false;
+                        in_provides = false;
+                    }
+                    b"format" => in_format = false,
+                    b"requires" => in_requires = false,
+                    b"provides" => in_provides = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(SpmError::other(format!("primary.xml parse error: {e}")));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(packages)
 }
 
 fn update_from_native(name: &str, config: &RepoConfig) -> SpmResult<()> {
@@ -1059,10 +1416,81 @@ fn sign_after_publish(_name: &str, config: &RepoConfig, base: &std::path::Path) 
     Ok(())
 }
 
-pub(crate) fn fetch_with_retry(url: &str, max_retries: u32) -> SpmResult<Vec<u8>> {
+/// Download a URL into memory, streaming with a progress bar.
+pub(crate) fn fetch_bytes_progress(url: &str, max_retries: u32, label: &str) -> SpmResult<Vec<u8>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
+        .build()
+        .new_agent();
     let mut last_error = None;
     for attempt in 1..=max_retries {
-        match ureq::get(url).call() {
+        match agent.get(url).call() {
+            Ok(response) => {
+                let total = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let mut pb = crate::output::ProgressBar::with_total(
+                    format!("{label}"),
+                    total.unwrap_or(0),
+                );
+                let mut reader = response.into_body().into_reader();
+                let mut buf = vec![0u8; 32768];
+                let mut data = Vec::new();
+                let mut had_error = false;
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            pb.tick_by(n as u64);
+                            pb.update();
+                        }
+                        Err(e) => {
+                            pb.fail(format!("Read error: {e}"));
+                            if attempt < max_retries {
+                                std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
+                            }
+                            last_error = Some(SpmError::network(format!(
+                                "Read error (attempt {attempt}/{max_retries}): {e}"
+                            )));
+                            had_error = true;
+                            break;
+                        }
+                    }
+                }
+                if !had_error {
+                    pb.finish(label);
+                    return Ok(data);
+                }
+            }
+            Err(e) => {
+                last_error = Some(SpmError::network(format!(
+                    "Attempt {attempt}/{max_retries}: {e}"
+                )));
+                if attempt < max_retries {
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        SpmError::network("Fetch failed after retries".to_string())
+    }))
+}
+
+/// Fetch a URL into memory without progress (for small files).
+pub(crate) fn fetch_with_retry(url: &str, max_retries: u32) -> SpmResult<Vec<u8>> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
+        .build()
+        .new_agent();
+    let mut last_error = None;
+    for attempt in 1..=max_retries {
+        match agent.get(url).call() {
             Ok(mut response) => {
                 match response.body_mut().with_config().limit(256 * 1024 * 1024).read_to_vec() {
                     Ok(body) => return Ok(body),

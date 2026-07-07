@@ -1,7 +1,7 @@
 # SPM — Samad Package Manager
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.4-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.3.5-blue" alt="Version">
   <img src="https://img.shields.io/badge/rustc-2021+-orange" alt="Rust Edition">
   <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-green" alt="License">
   <img src="https://img.shields.io/badge/status-beta-green" alt="Status">
@@ -162,10 +162,15 @@ cargo clippy --no-deps     # No warnings
 
 ## Project Status
 
-SPM is in **beta** (v0.3.4). The core feature set is complete: all 27+ package
+SPM is in **beta** (v0.3.5). The core feature set is complete: all 27+ package
 operations (install, remove, update, upgrade, search, info, files, history,
 sandbox, repo management, analysis, self-update, and more) work through the
 spmd daemon across 5 architectures (x86_64, aarch64, armv7, i686, riscv64).
+
+### v0.3.5 — Pre-install Conflict Detection
+- **Physical path scan before download**: checks `/usr/bin`, `/bin`, `/usr/local/bin`, `/usr/sbin`, `/sbin`, `/opt`, `/usr/games`, `~/.local/bin`, `~/bin` for existing files matching the package name
+- **Catastrophic --replace warning**: big red warning banner when forcing overwrite of files possibly owned by other package managers
+- **--replace passthrough fix**: the `--replace` flag now correctly reaches the daemon for normal `spm install` commands
 
 ---
 

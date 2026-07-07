@@ -330,6 +330,49 @@ pub(crate) fn repo_has_package(name: &str, repo_name: &str, repo_config: &RepoCo
     }
 }
 
+/// Check common filesystem paths for pre-existing files matching the package name.
+/// This is a heuristic check before downloading to warn about potential conflicts
+/// with other package managers.
+pub fn check_pre_install_paths(name: &str, uid: u32) -> Vec<String> {
+    let mut found = Vec::new();
+    let system_paths = [
+        "/usr/bin",
+        "/usr/local/bin",
+        "/bin",
+        "/usr/sbin",
+        "/usr/local/sbin",
+        "/sbin",
+        "/opt",
+        "/usr/games",
+    ];
+
+    for base in &system_paths {
+        let candidate = std::path::Path::new(base).join(name);
+        if candidate.exists() {
+            found.push(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    if uid != 0 {
+        use nix::unistd::{Uid, User};
+        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
+            let home = user.dir.to_string_lossy();
+            let user_paths = [
+                format!("{}/.local/bin", home),
+                format!("{}/bin", home),
+            ];
+            for base in &user_paths {
+                let candidate = std::path::Path::new(base).join(name);
+                if candidate.exists() {
+                    found.push(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    found
+}
+
 fn source_to_format(source: &RepoSource) -> PackageFormat {
     match source {
         RepoSource::Deb => PackageFormat::Deb,

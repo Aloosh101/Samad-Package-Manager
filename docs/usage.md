@@ -243,7 +243,7 @@ spm self-update
 spm self-update --check
 
 # Update to a specific version
-spm self-update --version 0.3.3
+spm self-update --version 0.3.5
 
 # After update, restart the daemon
 sudo systemctl restart spmd

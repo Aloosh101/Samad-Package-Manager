@@ -330,7 +330,11 @@ fn fetch_deb_http_to_temp(
     let deb_path = cache_dir.join(deb_filename);
 
     crate::output::step_info(format!("Downloading '{name}' from {deb_url}"));
-    let body = crate::config::repos::fetch_with_retry(&deb_url, 3)?;
+    let _total = crate::package::fetch::download::retry_download_resumable(
+        &deb_url, &deb_path, name,
+    )?;
+
+    let body = fs::read(&deb_path)?;
 
     if let Some(ref expected) = sha256 {
         let actual = crate::util::hash::sha256_hex(&body);
@@ -342,8 +346,6 @@ fn fetch_deb_http_to_temp(
         }
         tracing::debug!("SHA256 verified for '{}'", name);
     }
-
-    fs::write(&deb_path, &body)?;
 
     let extracted_dir = format!("{}/root", tmp_dir);
     super::deb::extract_deb(&deb_path.to_string_lossy(), &extracted_dir)?;

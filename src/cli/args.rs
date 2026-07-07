@@ -315,13 +315,13 @@ pub enum SpmCommand {
 
     /// Update spm and spmd to the latest version
     #[command(
-        after_help = "Downloads the latest release binary from GitHub and replaces /usr/bin/spm and /usr/bin/spmd.\nRequires spmd running (root).\n\nExamples:\n  spm self-update                     Update to latest version\n  spm self-update --check             Check for updates without installing\n  spm self-update --version 0.3.4     Update to a specific version"
+        after_help = "Downloads the latest release binary from GitHub and replaces /usr/bin/spm and /usr/bin/spmd.\nRequires spmd running (root).\n\nExamples:\n  spm self-update                     Update to latest version\n  spm self-update --check             Check for updates without installing\n  spm self-update --version 0.3.5     Update to a specific version"
     )]
     SelfUpdate {
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Update to a specific version (e.g. \"0.3.4\")
+        /// Update to a specific version (e.g. \"0.3.5\")
         #[arg(long)]
         version: Option<String>,
     },
@@ -503,6 +503,7 @@ impl SpmArgs {
                 } else {
                     let resp = client::send_command("install", serde_json::json!({
                         "package": package,
+                        "replace": replace,
                         "yes": yes,
                         "prefer_newest": prefer_newest,
                         "stable_debian": stable_debian,

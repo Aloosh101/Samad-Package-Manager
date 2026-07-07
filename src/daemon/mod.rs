@@ -26,7 +26,7 @@ pub fn socket_path() -> String {
         _ => "/run/spm.sock".to_string(),
     }
 }
-const SPM_GROUP: &str = "spm";
+// Allow all local users (no group restriction on personal systems)
 const MAX_CONCURRENT_PER_USER: u32 = 3;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const RATE_LIMIT_MAX: u32 = 10;
@@ -195,7 +195,7 @@ impl RateLimiter {
         &self,
         stream: UnixStream,
         uid: u32,
-        authorized: bool,
+        _authorized: bool,
     ) -> SpmResult<()> {
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
@@ -241,228 +241,168 @@ impl RateLimiter {
 
         let response = match action.as_str() {
             "install" => {
-                if authorized {
+                if uid == 0 {
                     handle_system_install(&req, uid).await.map(|m| (m, None))
                 } else {
                     handle_user_install(&req, uid).await.map(|m| (m, None))
                 }
             }
             "remove" => {
-                if authorized {
+                if uid == 0 {
                     handle_system_remove(&req, uid).await.map(|m| (m, None))
                 } else {
                     handle_user_remove(&req, uid).await.map(|m| (m, None))
                 }
             }
             "list" => {
-                let json = handle_list(&req, uid, authorized).await?;
+                let json = handle_list(&req, uid, uid == 0).await?;
                 let names: Vec<String> = serde_json::from_str(&json)
                     .unwrap_or_else(|_| vec![json.clone()]);
                 Ok((format!("{} package(s) installed", names.len()), Some(serde_json::json!(names))))
             }
             "upgrade" => {
-                if authorized {
+                if uid == 0 {
                     handle_upgrade(&req, uid).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can upgrade system packages"))
+                    Err(SpmError::permission_denied("Only root can upgrade system packages"))
                 }
             }
-            "update" => {
-                if authorized {
-                    handle_update().await.map(|m| (m, None))
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can update repositories"))
-                }
-            }
+            "update" => handle_update(uid).await.map(|m| (m, None)),
             "dist-upgrade" => {
-                if authorized {
+                if uid == 0 {
                     handle_dist_upgrade(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can run dist-upgrade"))
+                    Err(SpmError::permission_denied("Only root can run dist-upgrade"))
                 }
             }
             "purge" => {
-                if authorized {
+                if uid == 0 {
                     handle_purge(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can purge packages"))
+                    handle_user_remove(&req, uid).await.map(|m| (m, None))
                 }
             }
             "autoremove" => {
-                if authorized {
+                if uid == 0 {
                     handle_autoremove(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can autoremove packages"))
+                    Err(SpmError::permission_denied("Only root can autoremove packages"))
                 }
             }
             "cleanup" => {
-                if authorized {
+                if uid == 0 {
                     handle_cleanup(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can run cleanup"))
+                    Err(SpmError::permission_denied("Only root can run cleanup"))
                 }
             }
             "repo" => {
-                if authorized {
+                if uid == 0 {
                     handle_repo(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can manage repositories"))
+                    Err(SpmError::permission_denied("Only root can manage repositories"))
                 }
             }
             "snapshot" => {
-                if authorized {
+                if uid == 0 {
                     handle_snapshot(&req).await.map(|m| (m, None))
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can manage snapshots"))
+                    Err(SpmError::permission_denied("Only root can manage snapshots"))
                 }
             }
-            "convert" => {
-                if authorized {
-                    handle_convert(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can convert packages"))
-                }
-            }
-            "install-local" => {
-                if authorized {
-                    handle_install_local(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can install local packages"))
-                }
-            }
-            "install-sandbox" => {
-                if authorized {
-                    handle_install_sandbox(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can install sandboxes"))
-                }
-            }
-            "build" => {
-                if authorized {
-                    handle_build(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can build packages"))
-                }
-            }
+            "convert" => handle_convert(&req).await,
+            "install-local" => handle_install_local(&req).await,
+            "install-sandbox" => handle_install_sandbox(&req).await,
+            "build" => handle_build(&req).await,
             "search" => handle_search(&req).await,
             "search-file" => handle_search_file(&req).await,
             "info" => handle_info(&req).await,
             "files" => handle_files(&req).await,
             "depends" => handle_depends(&req).await,
             "rdepends" => handle_rdepends(&req).await,
-            "config-show" => {
-                if authorized {
-                    handle_config_show().await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can view config"))
-                }
-            }
+            "config-show" => handle_config_show().await,
             "config-set" => {
-                if authorized {
+                if uid == 0 {
                     handle_config_set(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can set config"))
+                    Err(SpmError::permission_denied("Only root can set config"))
                 }
             }
             "index-rebuild" => {
-                if authorized {
+                if uid == 0 {
                     handle_index_rebuild().await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can rebuild index"))
+                    Err(SpmError::permission_denied("Only root can rebuild index"))
                 }
             }
             "history" => handle_history(&req).await,
             "init" => {
-                if authorized {
+                if uid == 0 {
                     handle_init(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can initialize system"))
+                    Err(SpmError::permission_denied("Only root can initialize system"))
                 }
             }
             "group" => {
-                if authorized {
+                if uid == 0 {
                     handle_group(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can manage groups"))
+                    Err(SpmError::permission_denied("Only root can manage groups"))
                 }
             }
             "fsck" => {
-                if authorized {
+                if uid == 0 {
                     handle_fsck(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can run fsck"))
+                    Err(SpmError::permission_denied("Only root can run fsck"))
                 }
             }
             "sync" => {
-                if authorized {
+                if uid == 0 {
                     handle_sync(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can sync system"))
+                    Err(SpmError::permission_denied("Only root can sync system"))
                 }
             }
-            "repo-list" => {
-                if authorized {
-                    handle_repo_list().await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can list repos"))
-                }
-            }
+            "repo-list" => handle_repo_list().await,
             "repo-create" => {
-                if authorized {
+                if uid == 0 {
                     handle_repo_create(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can create repos"))
+                    Err(SpmError::permission_denied("Only root can create repos"))
                 }
             }
             "repo-publish" => {
-                if authorized {
+                if uid == 0 {
                     handle_repo_publish(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can publish packages"))
+                    Err(SpmError::permission_denied("Only root can publish packages"))
                 }
             }
             "repo-gen-key" => {
-                if authorized {
+                if uid == 0 {
                     handle_repo_gen_key(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can generate keys"))
+                    Err(SpmError::permission_denied("Only root can generate keys"))
                 }
             }
             "repo-sign" => {
-                if authorized {
+                if uid == 0 {
                     handle_repo_sign(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can sign repos"))
+                    Err(SpmError::permission_denied("Only root can sign repos"))
                 }
             }
             "sandbox-list" => handle_sandbox_list().await,
-            "sandbox-run" => {
-                if authorized {
-                    handle_sandbox_run(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can run sandboxes"))
-                }
-            }
+            "sandbox-run" => handle_sandbox_run(&req).await,
             "detect" => handle_detect(&req).await,
-            "analyze" => {
-                if authorized {
-                    handle_analyze(&req).await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can analyze system"))
-                }
-            }
-            "ps" => {
-                if authorized {
-                    handle_ps().await
-                } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can check processes"))
-                }
-            }
+            "analyze" => handle_analyze(&req).await,
+            "ps" => handle_ps(&req).await,
             "self-update" => {
-                if authorized {
+                if uid == 0 {
                     handle_self_update(&req).await
                 } else {
-                    Err(SpmError::permission_denied("Only root or 'spm' group can self-update"))
+                    Err(SpmError::permission_denied("Only root can self-update"))
                 }
             }
             other => Err(SpmError::other(format!("Unknown action: {other}"))),
@@ -502,7 +442,7 @@ impl RateLimiter {
 
 async fn handle_system_install(
     req: &DaemonRequest,
-    _uid: u32,
+    uid: u32,
 ) -> Result<String, SpmError> {
     let package = req.package.as_deref().ok_or_else(|| {
         SpmError::other("Missing 'package' field".to_string())
@@ -511,9 +451,38 @@ async fn handle_system_install(
     let params = req.params.as_ref();
     let strategy = resolve_strategy(req);
     let yes = params.and_then(|p| p["yes"].as_bool()).unwrap_or(true);
+    let replace = params.and_then(|p| p["replace"].as_bool()).unwrap_or(false);
+
+    if !replace {
+        let conflicts = crate::package::install::check_pre_install_paths(package, uid);
+        if !conflicts.is_empty() {
+            let paths = conflicts.join(", ");
+            return Err(SpmError::other(format!(
+                "File conflict detected: '{}' already exists at: {}. Remove it first or use --replace.",
+                package, paths
+            )));
+        }
+    } else {
+        use crate::output::send_msg;
+        let lines = [
+            "warn: ────────────────────────────────────────────────",
+            "warn: ⚠  WARNING  ⚠  --REPLACE ACTIVATED",
+            "warn: SPM will FORCE OVERWRITE files on your system.",
+            "warn: These files may belong to another package manager.",
+            "warn: This WILL break your package manager's tracking.",
+            "warn: You are on your own. NO SUPPORT if things break.",
+            "warn: Backup your data before proceeding.",
+            "warn: ────────────────────────────────────────────────",
+        ];
+        for l in &lines {
+            send_msg(l.to_string());
+        }
+    }
+
     let name = package.to_string();
+    let replace_clone = replace;
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
-        crate::package::install::install_package(&name, None, false, yes, false, strategy)
+        crate::package::install::install_package(&name, None, replace_clone, yes, false, strategy)
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
         .map_err(|e| SpmError::other(format!("Install failed: {e}")))?;
@@ -560,6 +529,35 @@ async fn handle_user_install(
     let package = req.package.as_deref().ok_or_else(|| {
         SpmError::other("Missing 'package' field".to_string())
     })?;
+
+    let params = req.params.as_ref();
+    let replace = params.and_then(|p| p["replace"].as_bool()).unwrap_or(false);
+
+    if !replace {
+        let conflicts = crate::package::install::check_pre_install_paths(package, uid);
+        if !conflicts.is_empty() {
+            let paths = conflicts.join(", ");
+            return Err(SpmError::other(format!(
+                "File conflict detected: '{}' already exists at: {}. Remove it first or use --replace.",
+                package, paths
+            )));
+        }
+    } else {
+        use crate::output::send_msg;
+        let lines = [
+            "warn: ────────────────────────────────────────────────",
+            "warn: ⚠  WARNING  ⚠  --REPLACE ACTIVATED",
+            "warn: SPM will FORCE OVERWRITE files on your system.",
+            "warn: These files may belong to another package manager.",
+            "warn: This WILL break your package manager's tracking.",
+            "warn: You are on your own. NO SUPPORT if things break.",
+            "warn: Backup your data before proceeding.",
+            "warn: ────────────────────────────────────────────────",
+        ];
+        for l in &lines {
+            send_msg(l.to_string());
+        }
+    }
 
     let user_name = crate::util::user::resolve_user_name(uid).unwrap_or_else(|| uid.to_string());
     let user_home = resolve_user_home(uid)?;
@@ -676,54 +674,17 @@ fn peer_cred(stream: &UnixStream) -> SpmResult<(u32, u32)> {
     Ok((ucred.uid, ucred.gid))
 }
 
-fn is_authorized(uid: u32) -> bool {
-    if uid == 0 {
-        return true;
-    }
-    let spm_gid = resolve_group_gid(SPM_GROUP);
-    let Some(target_gid) = spm_gid else {
-        return false;
-    };
-    // Look up username for this uid
-    let username = match resolve_user_name(uid) {
-        Some(n) => n,
-        None => return false,
-    };
-    // Call getgrouplist(3) to get all supplementary groups
-    let c_username = std::ffi::CString::new(username.as_str()).unwrap();
-    let mut ngroups: libc::c_int = 0;
-    // First call to get the size
-    let ret = unsafe {
-        libc::getgrouplist(c_username.as_ptr(), target_gid, std::ptr::null_mut(), &mut ngroups)
-    };
-    if ret == -1 && ngroups > 0 {
-        // Second call with proper buffer
-        let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
-        let ret = unsafe {
-            libc::getgrouplist(c_username.as_ptr(), target_gid, groups.as_mut_ptr(), &mut ngroups)
-        };
-        if ret != -1 {
-            for &g in &groups {
-                if g == target_gid {
-                    return true;
-                }
-            }
-        }
-    }
-    // Also check primary group via reentrant API
-    let primary_gid = match nix::unistd::User::from_name(&username) {
-        Ok(Some(user)) => user.gid.as_raw(),
-        _ => return false,
-    };
-    primary_gid == target_gid
+fn is_authorized(_uid: u32) -> bool {
+    true
 }
 
 fn resolve_user_name(uid: u32) -> Option<String> {
     crate::util::user::resolve_user_name(uid)
 }
 
-async fn handle_update() -> Result<String, SpmError> {
+async fn handle_update(uid: u32) -> Result<String, SpmError> {
     tokio::task::spawn_blocking(move || -> SpmResult<()> {
+        crate::output::set_current_uid(uid);
         crate::config::repos::update_repos()
     }).await
         .map_err(|e| SpmError::other(format!("Join error: {e}")))?
@@ -1316,9 +1277,12 @@ async fn handle_analyze(req: &DaemonRequest) -> HandlerResult {
     }
 }
 
-async fn handle_ps() -> HandlerResult {
-    let _ = tokio::task::spawn_blocking(crate::util::process::find_deleted_libs).await;
-    Ok(("Process check completed".to_string(), None))
+async fn handle_ps(req: &DaemonRequest) -> HandlerResult {
+    let deleted = req.params.as_ref().and_then(|p| p["deleted-libs"].as_bool()).unwrap_or(false);
+    if deleted {
+        let _ = tokio::task::spawn_blocking(crate::util::process::find_deleted_libs).await;
+    }
+    Ok(("spmd is running".to_string(), None))
 }
 
 async fn handle_self_update(req: &DaemonRequest) -> HandlerResult {
@@ -1615,8 +1579,8 @@ pub async fn run_daemon() -> SpmResult<()> {
         let l = UnixListener::bind(&sock)
             .map_err(|e| SpmError::other(format!("Cannot bind to {sock}: {e}")))?;
 
-        // Only spm group members can connect (authorization is via peer creds)
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660))
+        // Allow any local user to connect (personal system — no group restriction)
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666))
             .map_err(|e| SpmError::other(format!("Cannot set socket permissions: {e}")))?;
 
         l
